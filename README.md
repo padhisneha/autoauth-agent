@@ -131,6 +131,7 @@ Next.js 14 app. Payer reviewer dashboard.
 
 ## Architecture Diagram
 
+```text
                          ┌────────────────────────────┐
                          │     Provider UI            │
                          │     (Next.js - 3000)       │
@@ -203,6 +204,7 @@ Next.js 14 app. Payer reviewer dashboard.
                 │ • Generate appeal letter           │
                 │ • Auto-resubmit if denied          │
                 └────────────────────────────────────┘
+```
 
 ---
 
