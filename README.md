@@ -122,10 +122,87 @@ Next.js 14 app. Payer reviewer dashboard.
 
 **Features:**
 - Queue of all PA requests with appeal badge (`APPEAL`) for resubmissions
-- Full detail modal: patient info, diagnoses, clinical summary, appeal letter (scrollable)
+- Full detail modal: patient info, diagnoses, clinical summary, appeal letter
 - Approve / Deny decision form with denial reason dropdown
 - Stats header: total, pending, approved, denied, appeals
 - Auto-polls every 3s so new submissions appear without refresh
+
+---
+
+## Architecture Diagram
+
+                         ┌────────────────────────────┐
+                         │     Provider UI            │
+                         │     (Next.js - 3000)       │
+                         │                            │
+                         │ • Start Authorization      │
+                         │ • View Workflow            │
+                         │ • Prediction Panel         │
+                         └─────────────┬──────────────┘
+                                       │
+                                       ▼
+                         ┌────────────────────────────┐
+                         │       Backend API          │
+                         │     (FastAPI - 8000)       │
+                         │                            │
+                         │  ── Orchestration Layer ── │
+                         │  LangGraph Workflow        │
+                         └─────────────┬──────────────┘
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        ▼                              ▼                              ▼
+
+┌──────────────────┐        ┌──────────────────┐        ┌──────────────────┐
+│ Clinical Reader  │        │  Policy Agent    │        │ Prediction Engine│
+│                  │        │                  │        │                  │
+│ • Extract data   │        │ • Match rules    │        │ • Approval prob  │
+│ • Summarize      │        │ • Gap analysis   │        │ • Risk level     │
+└────────┬─────────┘        └────────┬─────────┘        └────────┬─────────┘
+         │                           │                           │
+         └──────────────┬────────────┴────────────┬──────────────┘
+                        ▼                         ▼
+                ┌────────────────────────────────────┐
+                │        Decision Engine             │
+                │                                    │
+                │ High   → Direct Submit             │
+                │ Medium → Add justification         │
+                │ Low    → Generate Appeal Early     │
+                └─────────────┬──────────────────────┘
+                              │
+                              ▼
+                ┌────────────────────────────────────┐
+                │        Submission Agent            │
+                │                                    │
+                │ • Build FHIR Bundle                │
+                │ • Send to Payer Server             │
+                └─────────────┬──────────────────────┘
+                              │ HTTP (FHIR API)
+                              ▼
+
+                ┌────────────────────────────────────┐
+                │     FHIR / Payer Server (8001)     │
+                │                                    │
+                │ • Stores requests                  │
+                │ • Returns ClaimResponse            │
+                │ • Decision API                     │
+                └─────────────┬──────────────────────┘
+                              │
+                              ▼
+                ┌────────────────────────────────────┐
+                │        Payer UI (3001)             │
+                │                                    │
+                │ • Review requests                  │
+                │ • Approve / Deny                   │
+                │ • View appeal letters              │
+                └─────────────┬──────────────────────┘
+                              │
+                              ▼
+                ┌────────────────────────────────────┐
+                │         Appeal Agent               │
+                │                                    │
+                │ • Generate appeal letter           │
+                │ • Auto-resubmit if denied          │
+                └────────────────────────────────────┘
 
 ---
 
