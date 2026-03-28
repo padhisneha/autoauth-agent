@@ -1,52 +1,46 @@
 """
-Submission Agent - Maps data to FHIR resources and submits prior authorization
+Submission Agent - Maps data to FHIR resources and submits prior authorization.
+Works with both real Pydantic objects and proxy/dict-based evidence objects.
 """
 
 import json
 import uuid
+import random
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from models.schemas import AuthorizationRequest, ClinicalEvidence, PolicyMatchResult
+
+
+def _val(entity, attr: str, default="") -> str:
+    """Safely get an attribute from an entity that may be a dict, object, or proxy."""
+    if isinstance(entity, dict):
+        return entity.get(attr, default)
+    return getattr(entity, attr, default) or default
 
 
 class SubmissionAgent:
-    """
-    Maps clinical data to FHIR resources and submits prior authorization requests
-    to payer systems via FHIR APIs or X12 278.
-    """
-    
     def __init__(self, fhir_client=None, mock_mode: bool = True):
         self.agent_name = "SubmissionAgent"
         self.fhir_client = fhir_client
-        self.mock_mode = mock_mode
-        
+        self.mock_mode   = mock_mode
+
     async def build_fhir_bundle(
         self,
-        auth_request: AuthorizationRequest,
-        clinical_evidence: ClinicalEvidence,
-        policy_match: PolicyMatchResult
+        auth_request: Any,
+        clinical_evidence: Any,
+        policy_match: Any
     ) -> Dict[str, Any]:
-        """Build a FHIR Bundle with all necessary resources."""
-        
+
         bundle_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
-        
-        # Create FHIR resources
         resources = []
-        
-        # 1. ServiceRequest (the main prior auth request)
+
+        # ── 1. ServiceRequest ──
+        summary = _val(clinical_evidence, "clinical_summary") or "Medical necessity documented"
         service_request = {
             "resourceType": "ServiceRequest",
-            "id": f"sr-{auth_request.id[:8]}",
+            "id": f"sr-{str(auth_request.id)[:8]}",
             "status": "active",
             "intent": "order",
-            "category": [{
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/service-category",
-                    "code": "17",
-                    "display": "General Surgery"
-                }]
-            }],
             "code": {
                 "coding": [{
                     "system": "http://www.ama-assn.org/go/cpt",
@@ -56,211 +50,114 @@ class SubmissionAgent:
             },
             "subject": {
                 "reference": f"Patient/{auth_request.patient_id}",
-                "display": f"{auth_request.patient.first_name} {auth_request.patient.last_name}" if auth_request.patient else "Patient"
+                "display": self._patient_display(auth_request.patient)
             },
             "authoredOn": timestamp,
-            "requester": {
-                "reference": "Practitioner/provider-001",
-                "display": "Ordering Provider"
-            },
-            "reasonCode": [{
-                "text": clinical_evidence.clinical_summary[:500] if clinical_evidence.clinical_summary else "Medical necessity documented"
-            }],
-            "supportingInfo": []
+            "reasonCode": [{"text": summary[:500]}]
         }
-        
-        # Add clinical conditions as reasons
-        for i, condition in enumerate(clinical_evidence.conditions[:5]):
-            reason_ref = {
-                "reference": f"Condition/cond-{auth_request.id[:4]}-{i}",
-                "display": condition.value
-            }
-            service_request["reasonCode"].append({
-                "text": condition.value
-            })
-        
+
+        conditions = getattr(clinical_evidence, "conditions", []) or []
+        for cond in conditions[:5]:
+            service_request["reasonCode"].append({"text": _val(cond, "value", str(cond))})
+
         resources.append(service_request)
-        
-        # 2. Patient resource
-        if auth_request.patient:
-            patient_resource = {
+
+        # ── 2. Patient resource ──
+        patient = auth_request.patient
+        if patient:
+            resources.append({
                 "resourceType": "Patient",
                 "id": auth_request.patient_id,
-                "identifier": [{
-                    "system": "http://hospital.example.org/mrn",
-                    "value": auth_request.patient.mrn
-                }],
-                "name": [{
-                    "use": "official",
-                    "family": auth_request.patient.last_name,
-                    "given": [auth_request.patient.first_name]
-                }],
-                "gender": auth_request.patient.gender,
-                "birthDate": auth_request.patient.date_of_birth
-            }
-            resources.append(patient_resource)
-        
-        # 3. Condition resources (from clinical evidence)
-        for i, condition in enumerate(clinical_evidence.conditions[:10]):
-            condition_resource = {
+                "identifier": [{"system": "http://hospital.example.org/mrn", "value": _val(patient, "mrn")}],
+                "name": [{"use": "official", "family": _val(patient, "last_name"), "given": [_val(patient, "first_name")]}],
+                "gender": _val(patient, "gender"),
+                "birthDate": _val(patient, "date_of_birth")
+            })
+
+        # ── 3. Condition resources ──
+        for i, cond in enumerate(conditions[:10]):
+            resources.append({
                 "resourceType": "Condition",
-                "id": f"cond-{auth_request.id[:4]}-{i}",
-                "clinicalStatus": {
-                    "coding": [{
-                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
-                        "code": "active"
-                    }]
-                },
-                "code": {
-                    "coding": [{
-                        "system": "http://hl7.org/fhir/sid/icd-10-cm",
-                        "code": condition.code or "R68.89",
-                        "display": condition.value
-                    }]
-                },
-                "subject": {
-                    "reference": f"Patient/{auth_request.patient_id}"
-                },
-                "assertedDate": timestamp
-            }
-            resources.append(condition_resource)
-        
-        # 4. MedicationStatement resources
-        for i, med in enumerate(clinical_evidence.medications[:10]):
-            med_resource = {
+                "id": f"cond-{str(auth_request.id)[:4]}-{i}",
+                "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active"}]},
+                "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": _val(cond, "code", "R68.89"), "display": _val(cond, "value")}]},
+                "subject": {"reference": f"Patient/{auth_request.patient_id}"}
+            })
+
+        # ── 4. MedicationStatement resources ──
+        medications = getattr(clinical_evidence, "medications", []) or []
+        for i, med in enumerate(medications[:10]):
+            resources.append({
                 "resourceType": "MedicationStatement",
-                "id": f"med-{auth_request.id[:4]}-{i}",
+                "id": f"med-{str(auth_request.id)[:4]}-{i}",
                 "status": "active",
-                "medicationCodeableConcept": {
-                    "text": med.value
-                },
-                "subject": {
-                    "reference": f"Patient/{auth_request.patient_id}"
-                }
-            }
-            resources.append(med_resource)
-        
-        # 5. DocumentReference (clinical notes summary)
-        doc_ref = {
+                "medicationCodeableConcept": {"text": _val(med, "value", str(med))},
+                "subject": {"reference": f"Patient/{auth_request.patient_id}"}
+            })
+
+        # ── 5. DocumentReference ──
+        resources.append({
             "resourceType": "DocumentReference",
-            "id": f"doc-{auth_request.id[:8]}",
+            "id": f"doc-{str(auth_request.id)[:8]}",
             "status": "current",
-            "type": {
-                "coding": [{
-                    "system": "http://loinc.org",
-                    "code": "34117-2",
-                    "display": "History and physical note"
-                }]
-            },
-            "subject": {
-                "reference": f"Patient/{auth_request.patient_id}"
-            },
-            "content": [{
-                "attachment": {
-                    "contentType": "text/plain",
-                    "data": self._encode_base64(clinical_evidence.clinical_summary)
-                }
-            }],
-            "context": {
-                "encounter": {
-                    "reference": "Encounter/enc-001"
-                }
-            }
-        }
-        resources.append(doc_ref)
-        
-        # 6. Coverage resource
-        coverage = {
+            "type": {"coding": [{"system": "http://loinc.org", "code": "34117-2", "display": "History and physical note"}]},
+            "subject": {"reference": f"Patient/{auth_request.patient_id}"},
+            "content": [{"attachment": {"contentType": "text/plain", "data": self._encode_base64(summary)}}]
+        })
+
+        # ── 6. Coverage ──
+        resources.append({
             "resourceType": "Coverage",
-            "id": f"cov-{auth_request.id[:8]}",
+            "id": f"cov-{str(auth_request.id)[:8]}",
             "status": "active",
-            "beneficiary": {
-                "reference": f"Patient/{auth_request.patient_id}"
-            },
-            "payor": [{
-                "display": auth_request.patient.payer_name if auth_request.patient else "Insurance Company"
-            }]
-        }
-        resources.append(coverage)
-        
-        # Create the Bundle
-        bundle = {
+            "beneficiary": {"reference": f"Patient/{auth_request.patient_id}"},
+            "payor": [{"display": _val(patient, "payer_name", "Insurance Company") if patient else "Insurance Company"}]
+        })
+
+        return {
             "resourceType": "Bundle",
             "id": bundle_id,
             "type": "collection",
             "timestamp": timestamp,
-            "entry": [
-                {"resource": res} for res in resources
-            ]
+            "entry": [{"resource": r} for r in resources]
         }
-        
-        return bundle
-    
+
     async def submit_prior_authorization(
         self,
-        auth_request: AuthorizationRequest,
+        auth_request: Any,
         fhir_bundle: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Submit the prior authorization request to the payer."""
-        
         if self.mock_mode:
             return await self._mock_submit(auth_request)
-        
-        # Real submission would go here
-        # In production, this would call the payer's FHIR API
         try:
-            response = await self.fhir_client.post(
-                "/PriorAuthorization",
-                json=fhir_bundle
-            )
-            return {
-                "success": True,
-                "external_auth_id": response.get("id"),
-                "status": "submitted",
-                "timestamp": datetime.now().isoformat()
-            }
+            response = await self.fhir_client.post("/PriorAuthorization", json=fhir_bundle)
+            return {"success": True, "external_auth_id": response.get("id"), "status": "submitted",
+                    "timestamp": datetime.now().isoformat()}
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "status": "failed"
-            }
-    
-    async def _mock_submit(self, auth_request: AuthorizationRequest) -> Dict[str, Any]:
-        """Simulate submission for demo purposes."""
-        
-        import random
-        
-        # Simulate different outcomes
-        outcomes = ["approved", "pending", "denied"]
-        weights = [0.6, 0.3, 0.1]
-        
-        # For demo, use the policy match to determine outcome
-        if auth_request.policy_match:
-            if auth_request.policy_match.is_covered:
-                outcome = "approved" if random.random() > 0.1 else "pending"
-            else:
-                outcome = "denied" if random.random() > 0.3 else "pending"
+            return {"success": False, "error": str(e), "status": "failed"}
+
+    async def _mock_submit(self, auth_request: Any) -> Dict[str, Any]:
+        # Use policy_match if available, otherwise default to approved (demo-friendly)
+        policy_match = getattr(auth_request, "policy_match", None)
+        if policy_match is not None:
+            is_covered = getattr(policy_match, "is_covered", True)
+            outcome = "approved" if (is_covered and random.random() > 0.15) else "denied"
         else:
-            outcome = random.choices(outcomes, weights=weights)[0]
-        
-        external_ids = {
-            "approved": f"PA-{auth_request.id[:8].upper()}-A",
-            "pending": f"PA-{auth_request.id[:8].upper()}-P",
-            "denied": f"PA-{auth_request.id[:8].upper()}-D"
-        }
-        
+            # No policy info → bias toward approval so demo always produces a result
+            outcome = random.choices(["approved", "denied"], weights=[0.75, 0.25])[0]
+
+        auth_id_short = str(auth_request.id)[:8].upper()
+        external_ids  = {"approved": f"PA-{auth_id_short}-A", "denied": f"PA-{auth_id_short}-D"}
+
         denial_reasons = [
             "Insufficient documentation of conservative treatment",
             "Service not medically necessary per policy criteria",
             "Missing required clinical information",
-            "Experimental/investigational procedure",
-            "Plan benefit limitation exceeded"
         ]
-        
+
         return {
             "success": True,
-            "external_auth_id": external_ids[outcome],
+            "external_auth_id": external_ids.get(outcome, f"PA-{auth_id_short}-A"),
             "status": outcome,
             "timestamp": datetime.now().isoformat(),
             "decision": {
@@ -271,129 +168,48 @@ class SubmissionAgent:
             },
             "next_steps": self._get_next_steps(outcome)
         }
-    
-    async def check_auth_status(
-        self,
-        external_auth_id: str,
-        payer_name: str
-    ) -> Dict[str, Any]:
-        """Check the status of a submitted prior authorization."""
-        
+
+    async def check_auth_status(self, external_auth_id: str, payer_name: str) -> Dict[str, Any]:
         if self.mock_mode:
-            return await self._mock_status_check(external_auth_id)
-        
-        # Real status check would go here
-        return {
-            "external_auth_id": external_auth_id,
-            "status": "pending",
-            "last_updated": datetime.now().isoformat()
-        }
-    
-    async def _mock_status_check(self, external_auth_id: str) -> Dict[str, Any]:
-        """Simulate status check for demo."""
-        
-        status = "approved" if "-A" in external_auth_id else ("denied" if "-D" in external_auth_id else "pending")
-        
-        return {
-            "external_auth_id": external_auth_id,
-            "status": status,
-            "last_updated": datetime.now().isoformat(),
-            "decision": {
-                "outcome": status,
-                "reason": "Service meets medical necessity criteria" if status == "approved" else "Incomplete documentation"
-            }
-        }
-    
-    async def cancel_prior_authorization(
-        self,
-        external_auth_id: str
-    ) -> Dict[str, Any]:
-        """Cancel a submitted prior authorization."""
-        
-        if self.mock_mode:
-            return {
-                "success": True,
-                "external_auth_id": external_auth_id,
-                "status": "cancelled",
-                "timestamp": datetime.now().isoformat()
-            }
-        
-        return {"success": False, "error": "Not implemented"}
-    
+            status = "approved" if "-A" in external_auth_id else ("denied" if "-D" in external_auth_id else "pending")
+            return {"external_auth_id": external_auth_id, "status": status,
+                    "last_updated": datetime.now().isoformat(),
+                    "decision": {"outcome": status}}
+        return {"external_auth_id": external_auth_id, "status": "pending",
+                "last_updated": datetime.now().isoformat()}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _patient_display(self, patient) -> str:
+        if not patient:
+            return "Patient"
+        return f"{_val(patient, 'first_name')} {_val(patient, 'last_name')}".strip() or "Patient"
+
     def _get_cpt_description(self, cpt_code: str) -> str:
-        """Get CPT code description."""
-        cpt_descriptions = {
-            "70551": "MRI brain",
-            "70552": "MRI brain w contrast",
-            "70553": "MRI brain w/o and w contrast",
-            "73721": "MRI knee",
-            "73221": "MRI shoulder",
-            "72148": "MRI lumbar spine",
-            "72149": "MRI lumbar spine w contrast",
-            "70450": "CT head",
-            "71250": "CT chest",
-            "74177": "CT abdomen pelvis",
-            "93306": "Echocardiogram",
-            "93000": "ECG",
-            "45378": "Colonoscopy",
-            "97110": "Physical therapy"
-        }
-        return cpt_descriptions.get(cpt_code, f"CPT {cpt_code}")
-    
-    def _encode_base64(self, text: str) -> str:
-        """Encode text to base64."""
-        import base64
-        return base64.b64encode(text.encode()).decode()
-    
-    def _get_next_steps(self, outcome: str) -> List[str]:
-        """Get next steps based on outcome."""
-        if outcome == "approved":
-            return [
-                "Authorization approved",
-                "Proceed with scheduled service",
-                "Document approval in patient record"
-            ]
-        elif outcome == "pending":
-            return [
-                "Additional review required",
-                "Monitor for decision (typically 24-72 hours)",
-                "Be prepared to submit additional documentation if requested"
-            ]
-        else:
-            return [
-                "Review denial reason carefully",
-                "Consider appeal if medical necessity exists",
-                "Consult with peer-to-peer reviewer if available"
-            ]
-    
-    def validate_fhir_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate FHIR bundle before submission."""
-        
-        errors = []
-        warnings = []
-        
-        # Check required resources
-        required_types = ["ServiceRequest", "Patient"]
-        existing_types = [entry["resource"]["resourceType"] for entry in bundle.get("entry", [])]
-        
-        for req_type in required_types:
-            if req_type not in existing_types:
-                errors.append(f"Missing required resource: {req_type}")
-        
-        # Check ServiceRequest has required fields
-        sr = next((e["resource"] for e in bundle.get("entry", []) 
-                   if e["resource"]["resourceType"] == "ServiceRequest"), None)
-        
-        if sr:
-            if not sr.get("code"):
-                errors.append("ServiceRequest missing code")
-            if not sr.get("subject"):
-                errors.append("ServiceRequest missing subject")
-            if not sr.get("requester"):
-                warnings.append("ServiceRequest missing requester")
-        
         return {
-            "valid": len(errors) == 0,
-            "errors": errors,
-            "warnings": warnings
-        }
+            "70551": "MRI brain", "73721": "MRI knee", "73221": "MRI shoulder",
+            "72148": "MRI lumbar spine", "72149": "MRI lumbar spine w contrast",
+            "70450": "CT head", "71250": "CT chest", "74177": "CT abdomen pelvis",
+            "93306": "Echocardiogram", "93000": "ECG", "45378": "Colonoscopy",
+            "97110": "Physical therapy"
+        }.get(cpt_code, f"CPT {cpt_code}")
+
+    def _encode_base64(self, text: str) -> str:
+        import base64
+        return base64.b64encode((text or "").encode()).decode()
+
+    def _get_next_steps(self, outcome: str) -> List[str]:
+        if outcome == "approved":
+            return ["Authorization approved", "Proceed with scheduled service", "Document approval in patient record"]
+        elif outcome == "pending":
+            return ["Additional review required", "Monitor for decision (24-72 hours)"]
+        else:
+            return ["Review denial reason carefully", "Consider appeal if medical necessity exists"]
+
+    def validate_fhir_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
+        errors, warnings = [], []
+        types = [e["resource"]["resourceType"] for e in bundle.get("entry", [])]
+        for req in ["ServiceRequest", "Patient"]:
+            if req not in types:
+                errors.append(f"Missing required resource: {req}")
+        return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}

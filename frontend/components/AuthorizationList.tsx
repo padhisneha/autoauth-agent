@@ -2,14 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  FileCheck, 
-  Clock, 
-  CheckCircle2, 
-  XCircle, 
-  ChevronRight,
-  Search,
-  Filter
+import {
+  FileCheck, Clock, CheckCircle2, XCircle, ChevronRight, Filter
 } from 'lucide-react';
 import { cn, getStatusColor } from '@/lib/utils';
 
@@ -19,7 +13,7 @@ interface Authorization {
   patient: {
     first_name: string;
     last_name: string;
-  };
+  } | null;
   service_type: string;
   cpt_code: string;
   status: string;
@@ -30,6 +24,11 @@ interface AuthorizationListProps {
   onSelectAuth?: (authId: string) => void;
 }
 
+/** Normalise "WorkflowState.APPROVED" → "approved" */
+function normaliseStatus(raw: string): string {
+  return (raw || '').split('.').pop()?.toLowerCase() ?? 'pending';
+}
+
 export function AuthorizationList({ onSelectAuth }: AuthorizationListProps) {
   const [authorizations, setAuthorizations] = useState<Authorization[]>([]);
   const [selectedAuth, setSelectedAuth] = useState<string | null>(null);
@@ -37,7 +36,7 @@ export function AuthorizationList({ onSelectAuth }: AuthorizationListProps) {
 
   useEffect(() => {
     fetchAuthorizations();
-    const interval = setInterval(fetchAuthorizations, 5000);
+    const interval = setInterval(fetchAuthorizations, 3000);
     return () => clearInterval(interval);
   }, []);
 
@@ -51,22 +50,25 @@ export function AuthorizationList({ onSelectAuth }: AuthorizationListProps) {
     }
   };
 
-  const filteredAuths = authorizations.filter(auth => 
-    filter === 'all' || auth.status.toLowerCase() === filter
-  );
+  const filteredAuths = authorizations.filter(auth => {
+    const status = normaliseStatus(auth.status);
+    return filter === 'all' || status === filter;
+  });
 
-  const getStatusIcon = (status: string) => {
-    switch (status.toLowerCase()) {
-      case 'approved':
-        return <CheckCircle2 className="w-4 h-4 text-green-500" />;
-      case 'denied':
-        return <XCircle className="w-4 h-4 text-red-500" />;
+  const getStatusIcon = (rawStatus: string) => {
+    const status = normaliseStatus(rawStatus);
+    switch (status) {
+      case 'approved':   return <CheckCircle2 className="w-4 h-4 text-green-500" />;
+      case 'denied':     return <XCircle className="w-4 h-4 text-red-500" />;
       case 'pending':
-      case 'processing':
-        return <Clock className="w-4 h-4 text-yellow-500" />;
-      default:
-        return <FileCheck className="w-4 h-4 text-slate-400" />;
+      case 'processing': return <Clock className="w-4 h-4 text-yellow-500" />;
+      default:           return <FileCheck className="w-4 h-4 text-slate-400" />;
     }
+  };
+
+  const getPatientName = (auth: Authorization) => {
+    if (!auth.patient) return auth.patient_id;
+    return `${auth.patient.first_name || ''} ${auth.patient.last_name || ''}`.trim() || auth.patient_id;
   };
 
   return (
@@ -77,7 +79,7 @@ export function AuthorizationList({ onSelectAuth }: AuthorizationListProps) {
           <h2 className="text-lg font-semibold text-slate-900">Authorizations</h2>
           <div className="flex items-center gap-2">
             <Filter className="w-4 h-4 text-slate-400" />
-            <select 
+            <select
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               className="text-sm border-0 bg-transparent text-slate-600 focus:ring-0"
@@ -101,49 +103,50 @@ export function AuthorizationList({ onSelectAuth }: AuthorizationListProps) {
               <p className="text-sm text-slate-400">Select a demo scenario to get started</p>
             </div>
           ) : (
-            filteredAuths.map((auth, index) => (
-              <motion.button
-                key={auth.id}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: index * 0.05 }}
-                onClick={() => {
-                  setSelectedAuth(auth.id);
-                  onSelectAuth?.(auth.id);
-                }}
-                className={cn(
-                  "w-full px-6 py-4 flex items-center justify-between hover:bg-slate-50 transition-colors text-left",
-                  selectedAuth === auth.id && "bg-blue-50"
-                )}
-              >
-                <div className="flex items-center gap-4">
-                  {getStatusIcon(auth.status)}
-                  <div>
-                    <p className="font-medium text-slate-900">
-                      {auth.patient.first_name} {auth.patient.last_name}
-                    </p>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-xs px-2 py-0.5 bg-slate-100 rounded text-slate-600">
-                        {auth.cpt_code}
-                      </span>
-                      <span className="text-xs text-slate-400 capitalize">
-                        {auth.service_type.replace('_', ' ')}
-                      </span>
+            filteredAuths.map((auth, index) => {
+              const displayStatus = normaliseStatus(auth.status);
+              return (
+                <motion.button
+                  key={auth.id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: index * 0.05 }}
+                  onClick={() => {
+                    setSelectedAuth(auth.id);
+                    onSelectAuth?.(auth.id);
+                  }}
+                  className={cn(
+                    "w-full px-6 py-4 flex items-center justify-between hover:bg-slate-50 transition-colors text-left",
+                    selectedAuth === auth.id && "bg-blue-50"
+                  )}
+                >
+                  <div className="flex items-center gap-4">
+                    {getStatusIcon(auth.status)}
+                    <div>
+                      <p className="font-medium text-slate-900">{getPatientName(auth)}</p>
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className="text-xs px-2 py-0.5 bg-slate-100 rounded text-slate-600">
+                          {auth.cpt_code}
+                        </span>
+                        <span className="text-xs text-slate-400 capitalize">
+                          {(auth.service_type || '').replace(/_/g, ' ')}
+                        </span>
+                      </div>
                     </div>
                   </div>
-                </div>
-                
-                <div className="flex items-center gap-3">
-                  <span className={cn(
-                    "text-xs px-2 py-1 rounded-full font-medium capitalize",
-                    getStatusColor(auth.status)
-                  )}>
-                    {auth.status}
-                  </span>
-                  <ChevronRight className="w-4 h-4 text-slate-400" />
-                </div>
-              </motion.button>
-            ))
+
+                  <div className="flex items-center gap-3">
+                    <span className={cn(
+                      "text-xs px-2 py-1 rounded-full font-medium capitalize",
+                      getStatusColor(displayStatus)
+                    )}>
+                      {displayStatus}
+                    </span>
+                    <ChevronRight className="w-4 h-4 text-slate-400" />
+                  </div>
+                </motion.button>
+              );
+            })
           )}
         </AnimatePresence>
       </div>
