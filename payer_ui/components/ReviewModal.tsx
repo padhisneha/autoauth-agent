@@ -192,7 +192,7 @@ export function ReviewModal({ item, onClose, onDecision }: Props) {
                       </button>
                     </div>
                   </div>
-                  <div className="bg-white p-4" style={{maxHeight:letterOpen?'400px':'80px',overflow:'hidden',transition:'max-height 0.3s'}}>
+                  <div className="bg-white p-4" style={{maxHeight:letterOpen?'480px':'80px',overflowY:letterOpen?'auto':'hidden',transition:'max-height 0.3s ease'}}>
                     <pre className="text-xs text-slate-700 whitespace-pre-wrap font-mono leading-relaxed">{appealLetter}</pre>
                   </div>
                   {!letterOpen && <p className="text-xs text-amber-600 px-4 pb-2">→ Click "Read Full" to see the complete letter</p>}

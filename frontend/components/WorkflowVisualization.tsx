@@ -166,9 +166,11 @@ export function WorkflowVisualization({ authId }: Props) {
   const appealGenerated  = !!(ws?.appeal_letter);
   const appealSubmitted  = ['appeal_submission','appeal_monitoring','appeal_approved','appeal_denied'].includes(cur);
   const pred             = ws?.prediction;
+  const isTerminal = ['approved','denied','appeal_approved','appeal_denied','appeal_submission'].includes(cur);
+  const showFullPrediction = pred && !isTerminal;
 
   return (
-    <div className="bg-white rounded-2xl border border-slate-200 shadow-lg overflow-hidden">
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-lg">
       {/* Header */}
       <div className="bg-gradient-to-r from-slate-900 to-slate-800 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -193,7 +195,7 @@ export function WorkflowVisualization({ authId }: Props) {
 
       <div className="p-6 space-y-5">
         {/* Stage pipeline */}
-        <div className="overflow-x-auto pb-2">
+        <div className="overflow-x-auto pb-2 pt-2">
           <div className="flex items-start min-w-max">
             {displayStages.map((stage, idx) => {
               const status = stageStatus(stage.id);
@@ -210,7 +212,7 @@ export function WorkflowVisualization({ authId }: Props) {
                         status==='active'    && `bg-white shadow-lg ${col.border}`,
                         status==='pending'   && "border-slate-200 bg-slate-50"
                       )}
-                      animate={status==='active'?{scale:[1,1.08,1]}:{}}
+                      animate={status==='active'?{scale:[1,1.04,1]}:{}}
                       transition={{duration:2,repeat:Infinity}}
                     >
                       {status==='completed' && <CheckCircle2 className="w-5 h-5 text-green-500"/>}
@@ -246,7 +248,7 @@ export function WorkflowVisualization({ authId }: Props) {
 
         {/* 🔮 Prediction Panel */}
         <AnimatePresence>
-          {pred && (
+          {showFullPrediction && (
             <motion.div initial={{opacity:0,y:6}} animate={{opacity:1,y:0}}
               className={cn("rounded-xl border p-4",
                 pred.risk_level==='low'    ? "bg-green-50 border-green-200"  :
@@ -308,6 +310,18 @@ export function WorkflowVisualization({ authId }: Props) {
           )}
         </AnimatePresence>
 
+
+        {/* Compact prediction badge — shown once terminal */}
+        {pred && isTerminal && (
+          <div className={cn("flex items-center gap-3 rounded-xl px-4 py-2.5 border text-sm",
+            pred.risk_level==='low'    ? "bg-green-50 border-green-200 text-green-800" :
+            pred.risk_level==='medium' ? "bg-yellow-50 border-yellow-200 text-yellow-800" :
+                                         "bg-red-50 border-red-200 text-red-800")}>
+            <BarChart2 className="w-4 h-4 flex-shrink-0"/>
+            <span className="font-semibold">{Math.round(pred.approval_probability*100)}% predicted approval</span>
+            <span className="text-xs opacity-60 ml-1">· {pred.strategy.replace(/_/g,' ')}</span>
+          </div>
+        )}
         {/* Agent output cards */}
         {ws?.agents && Object.keys(ws.agents).length > 0 && (
           <div className="border-t border-slate-100 pt-3">
@@ -352,7 +366,7 @@ export function WorkflowVisualization({ authId }: Props) {
           {/* Appeal letter panel */}
           {appealGenerated && !isApproved && !isAppealApproved && (
             <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}}
-              className="border border-amber-200 rounded-xl overflow-hidden">
+              className="border border-amber-200 rounded-xl">
 
               {/* Header bar */}
               <div className="bg-amber-50 px-4 py-3 flex items-center justify-between">
