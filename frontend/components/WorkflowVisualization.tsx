@@ -258,7 +258,7 @@ export function WorkflowVisualization({ authId }: Props) {
                 <div className="flex items-center gap-2">
                   <BarChart2 className={cn("w-4 h-4",
                     pred.risk_level==='low'?'text-green-600':pred.risk_level==='medium'?'text-yellow-600':'text-red-600')}/>
-                  <p className="font-semibold text-slate-800 text-sm">🔮 Prediction Engine</p>
+                  <p className="font-semibold text-slate-800 text-sm">Prediction Engine</p>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className={cn("text-lg font-bold",

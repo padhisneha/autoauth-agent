@@ -130,7 +130,7 @@ export default function PayerDashboard() {
                         {item.status.replace('_',' ')}
                       </span>
                       {item.is_appeal && (
-                        <span className="text-xs px-2 py-0.5 rounded-full font-bold bg-amber-200 text-amber-800">⚡ APPEAL</span>
+                        <span className="text-xs px-2 py-0.5 rounded-full font-bold bg-amber-200 text-amber-800"> APPEAL</span>
                       )}
                       {item.has_appeal_letter && !item.is_appeal && (
                         <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">Letter attached</span>
@@ -152,7 +152,7 @@ export default function PayerDashboard() {
                     {item.decided_at && <p className="text-xs text-slate-400">Decided {elapsed(item.decided_at)}</p>}
                     {(item.status==='pending'||item.status==='under_review') && (
                       <p className="text-xs font-semibold text-yellow-600 mt-1">
-                        {item.is_appeal ? '⚡ Appeal needs review' : 'Needs Review'}
+                        {item.is_appeal ? 'Appeal needs review' : 'Needs Review'}
                       </p>
                     )}
                   </div>

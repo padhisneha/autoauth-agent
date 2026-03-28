@@ -2,7 +2,7 @@
 Orchestration Layer — AutoAuth Agent multi-agent workflow with Prediction Engine.
 
 Flow:
-  Triage → Evidence → Policy → 🔮 Prediction → Decision Engine
+  Triage → Evidence → Policy → Prediction → Decision Engine
      → [if high prob] Submit → Payer → approved ✓
      → [if low prob]  Generate appeal EARLY → Submit + attach justification → Payer
         → if denied → instantly resubmit appeal (already ready)
@@ -210,7 +210,7 @@ class AuthorizationWorkflow:
 
     async def _prediction(self, state, auth_req, cb):
         """
-        🔮 Prediction Engine — scores approval probability using:
+        Prediction Engine — scores approval probability using:
         - Policy match score
         - Clinical evidence completeness
         - Medical necessity score
@@ -284,7 +284,7 @@ class AuthorizationWorkflow:
 
     async def _decision_engine(self, state, auth_req, cb):
         """
-        🧠 Decision Engine — acts on the prediction:
+        Decision Engine — acts on the prediction:
         - HIGH prob  → submit directly
         - MEDIUM prob → submit with extra clinical justification note
         - LOW prob   → generate appeal letter NOW before submitting, attach to submission

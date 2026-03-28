@@ -21,8 +21,8 @@ All four services run independently. The provider UI proxies `/api/*` to the bac
 
 ```
 Triage → Clinical Evidence → Policy Match → Validation
-  → 🔮 Prediction Engine (approval probability)
-  → 🧠 Decision Engine:
+  → Prediction Engine (approval probability)
+  → Decision Engine:
       high prob  → Submit directly
       medium     → Submit with enhanced justification
       low prob   → Generate appeal letter NOW, attach to submission
@@ -121,7 +121,7 @@ LiveActivityFeed.tsx        Recent authorization events
 Next.js 14 app. Payer reviewer dashboard.
 
 **Features:**
-- Queue of all PA requests with appeal badge (`⚡ APPEAL`) for resubmissions
+- Queue of all PA requests with appeal badge (`APPEAL`) for resubmissions
 - Full detail modal: patient info, diagnoses, clinical summary, appeal letter (scrollable)
 - Approve / Deny decision form with denial reason dropdown
 - Stats header: total, pending, approved, denied, appeals
@@ -176,7 +176,7 @@ cd payer_ui && npm install
 7. On the payer portal, click the request → read the clinical summary → Approve or Deny
 8. The provider UI updates automatically when the decision comes in
 9. If **denied**: the appeal letter was already generated (or generates now) → automatically resubmitted
-10. The appeal appears in the payer queue with an `⚡ APPEAL` badge → reviewer decides again
+10. The appeal appears in the payer queue with an `APPEAL` badge → reviewer decides again
 
 ---
 
