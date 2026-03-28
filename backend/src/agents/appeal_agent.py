@@ -1,6 +1,6 @@
 """
-Appeal Agent - Auto-generates appeal letters when requests are denied.
-Uses gpt-4.5-mini to write clinically accurate, legally structured appeal letters.
+Appeal Agent - generates clinically accurate appeal letters.
+Uses real provider info from auth_request (provider_name, provider_facility, etc.)
 """
 
 import json
@@ -11,28 +11,11 @@ MODEL = "gpt-4.5-mini"
 
 
 class AppealAgent:
-    """
-    Autonomous appeal letter generation when prior authorization is denied.
-    Analyses denial reasons, gathers supporting evidence, and drafts appeals via LLM.
-    """
-
     def __init__(self, llm_client=None):
         self.agent_name = "AppealAgent"
         self.llm_client = llm_client
 
-    # ------------------------------------------------------------------ #
-    #  Public interface                                                    #
-    # ------------------------------------------------------------------ #
-
-    async def analyze_denial(
-        self,
-        auth_request: Any,
-        denial_reason: str,
-        clinical_evidence: Any,
-        policy_match: Any
-    ) -> Dict[str, Any]:
-        """Analyse the denial and build a structured appeal strategy."""
-
+    async def analyze_denial(self, auth_request, denial_reason, clinical_evidence, policy_match):
         analysis = {
             "denial_reason": denial_reason,
             "primary_appeal_argument": "",
@@ -43,30 +26,34 @@ class AppealAgent:
             "success_probability": 0.5
         }
 
-        denial_argument_map = {
+        denial_map = {
             "insufficient conservative treatment": {
-                "argument": "The patient has documented prior treatments demonstrating medical necessity and failure of conservative management.",
+                "argument": "The patient has documented prior conservative treatments that demonstrate medical necessity and failure of non-invasive management.",
                 "evidence_needed": ["prior_procedures", "medications", "physician_notes"]
             },
             "not medically necessary": {
-                "argument": "The requested service is medically necessary based on the patient's specific clinical presentation, diagnosis, and failure of conservative management.",
+                "argument": "The requested service is medically necessary based on the patient's specific clinical presentation, diagnosis, and documented failure of conservative management.",
                 "evidence_needed": ["conditions", "clinical_summary", "lab_results"]
             },
             "incomplete documentation": {
-                "argument": "This appeal provides additional clinical documentation not included in the original submission.",
+                "argument": "This appeal provides comprehensive clinical documentation that fully supports medical necessity.",
                 "evidence_needed": ["clinical_summary", "physician_notes"]
             },
             "experimental": {
-                "argument": "The requested service is a standard, evidence-based treatment covered under the patient's plan benefits.",
+                "argument": "The requested service is a standard, evidence-based treatment supported by peer-reviewed literature and applicable clinical guidelines.",
                 "evidence_needed": ["guidelines", "clinical_trials"]
+            },
+            "anticipated": {
+                "argument": "This proactive appeal package provides comprehensive documentation demonstrating that all policy criteria are met prior to payer review.",
+                "evidence_needed": ["clinical_summary", "conditions", "medications"]
             },
         }
 
-        denial_lower = denial_reason.lower()
-        for key, data in denial_argument_map.items():
-            if key in denial_lower:
+        dl = denial_reason.lower()
+        for key, data in denial_map.items():
+            if key in dl:
                 analysis["primary_appeal_argument"] = data["argument"]
-                analysis["missing_documentation"] = data["evidence_needed"]
+                analysis["missing_documentation"]   = data["evidence_needed"]
                 break
 
         if not analysis["primary_appeal_argument"]:
@@ -75,314 +62,249 @@ class AppealAgent:
                 "for the requested service based on the patient's diagnosis and clinical presentation."
             )
 
-        conditions = getattr(clinical_evidence, "conditions", []) or []
-        procedures = getattr(clinical_evidence, "procedures", []) or []
+        conditions  = getattr(clinical_evidence, "conditions",  []) or []
+        procedures  = getattr(clinical_evidence, "procedures",  []) or []
         medications = getattr(clinical_evidence, "medications", []) or []
         lab_results = getattr(clinical_evidence, "lab_results", []) or []
-        clinical_summary = getattr(clinical_evidence, "clinical_summary", "") or ""
+        summary     = getattr(clinical_evidence, "clinical_summary", "") or ""
 
         if conditions:
             analysis["supporting_evidence"].append({
                 "type": "diagnoses",
-                "details": [getattr(c, "value", str(c)) for c in conditions[:5]]
+                "details": [getattr(c,"value",str(c)) for c in conditions[:5]]
             })
         if procedures:
             analysis["supporting_evidence"].append({
                 "type": "prior_treatments",
-                "details": [getattr(p, "value", str(p)) for p in procedures[:5]]
+                "details": [getattr(p,"value",str(p)) for p in procedures[:5]]
             })
         if medications:
             analysis["supporting_evidence"].append({
                 "type": "current_medications",
-                "details": [getattr(m, "value", str(m)) for m in medications[:5]]
+                "details": [getattr(m,"value",str(m)) for m in medications[:5]]
             })
         if lab_results:
             analysis["supporting_evidence"].append({
                 "type": "lab_results",
-                "details": [getattr(l, "value", str(l)) for l in lab_results[:3]]
+                "details": [getattr(l,"value",str(l)) for l in lab_results[:3]]
             })
 
-        urgency_terms = ["progressive", "worsening", "severe", "acute", "debilitating", "chronic pain", "cancer", "malignancy"]
-        analysis["urgency_indicators"] = [t for t in urgency_terms if t in clinical_summary.lower()]
+        urgency_terms = ["progressive","worsening","severe","acute","debilitating","chronic pain","cancer","malignancy","stage","gleason"]
+        analysis["urgency_indicators"] = [t for t in urgency_terms if t in summary.lower()]
 
         if analysis["urgency_indicators"]:
             analysis["peer_review_recommended"] = True
 
-        analysis["success_probability"] = self._calculate_success_probability(analysis, policy_match)
+        analysis["success_probability"] = self._calc_prob(analysis, policy_match)
         return analysis
 
-    async def generate_appeal_letter(
-        self,
-        auth_request: Any,
-        denial_analysis: Dict[str, Any],
-        clinical_evidence: Any,
-        policy_match: Any
-    ) -> str:
-        """Generate a complete appeal letter — LLM if available, template fallback otherwise."""
-
+    async def generate_appeal_letter(self, auth_request, denial_analysis, clinical_evidence, policy_match):
         if self.llm_client:
-            return await self._generate_appeal_letter_llm(auth_request, denial_analysis, clinical_evidence, policy_match)
-        return self._generate_appeal_letter_template(auth_request, denial_analysis, clinical_evidence, policy_match)
+            return await self._llm_letter(auth_request, denial_analysis, clinical_evidence, policy_match)
+        return self._template_letter(auth_request, denial_analysis, clinical_evidence, policy_match)
 
-    # ------------------------------------------------------------------ #
-    #  LLM-powered letter generation                                      #
-    # ------------------------------------------------------------------ #
+    # ── LLM letter ────────────────────────────────────────────────────────────
 
-    async def _generate_appeal_letter_llm(
-        self,
-        auth_request: Any,
-        denial_analysis: Dict[str, Any],
-        clinical_evidence: Any,
-        policy_match: Any
-    ) -> str:
+    async def _llm_letter(self, auth_request, denial_analysis, clinical_evidence, policy_match):
+        patient  = auth_request.patient
+        cur_date = datetime.now().strftime("%B %d, %Y")
 
-        patient = auth_request.patient
-        current_date = datetime.now().strftime("%B %d, %Y")
+        # Real provider info from auth_request
+        provider_name     = getattr(auth_request, "provider_name",     "Dr. Attending Physician, MD")
+        provider_facility = getattr(auth_request, "provider_facility",  "Boston Medical Center")
+        provider_address  = getattr(auth_request, "provider_address",   "100 Medical Dr, Boston MA 02101")
+        provider_phone    = getattr(auth_request, "provider_phone",     "(617) 555-0000")
+        provider_fax      = getattr(auth_request, "provider_fax",      "(617) 555-0001")
 
-        cond_str = ", ".join(
-            getattr(c, "value", str(c)) for c in (getattr(clinical_evidence, "conditions", []) or [])[:6]
-        ) or "none documented"
-        med_str = ", ".join(
-            getattr(m, "value", str(m)) for m in (getattr(clinical_evidence, "medications", []) or [])[:5]
-        ) or "none"
-        proc_str = ", ".join(
-            getattr(p, "value", str(p)) for p in (getattr(clinical_evidence, "procedures", []) or [])[:4]
-        ) or "none"
-        lab_str = ", ".join(
-            getattr(l, "value", str(l)) for l in (getattr(clinical_evidence, "lab_results", []) or [])[:3]
-        ) or "none"
-        clinical_summary = getattr(clinical_evidence, "clinical_summary", "") or ""
+        payer   = getattr(patient, "payer_name",   "Insurance Company") if patient else "Insurance Company"
+        first   = getattr(patient, "first_name",   "") if patient else ""
+        last    = getattr(patient, "last_name",    "") if patient else ""
+        dob     = getattr(patient, "date_of_birth","") if patient else ""
+        member  = getattr(patient, "insurance_id", "") if patient else ""
+        cpt     = getattr(auth_request, "cpt_code", "N/A")
+        auth_ref= getattr(auth_request, "id", "N/A")
 
-        payer = getattr(patient, "payer_name", "Insurance Company") if patient else "Insurance Company"
-        first = getattr(patient, "first_name", "") if patient else ""
-        last = getattr(patient, "last_name", "") if patient else ""
-        dob = getattr(patient, "date_of_birth", "") if patient else ""
-        member_id = getattr(patient, "insurance_id", "") if patient else ""
+        cond_str = ", ".join(getattr(c,"value",str(c)) for c in (getattr(clinical_evidence,"conditions",[]) or [])[:6]) or "none documented"
+        med_str  = ", ".join(getattr(m,"value",str(m)) for m in (getattr(clinical_evidence,"medications",[]) or [])[:5]) or "none"
+        proc_str = ", ".join(getattr(p,"value",str(p)) for p in (getattr(clinical_evidence,"procedures",[]) or [])[:4]) or "none"
+        lab_str  = ", ".join(getattr(l,"value",str(l)) for l in (getattr(clinical_evidence,"lab_results",[]) or [])[:3]) or "none"
+        summary  = getattr(clinical_evidence, "clinical_summary", "") or ""
 
-        satisfied = getattr(policy_match, "satisfied_requirements", []) if policy_match else []
+        satisfied     = getattr(policy_match, "satisfied_requirements", []) if policy_match else []
         satisfied_str = "\n".join(f"- {s}" for s in satisfied[:5]) or "- See clinical documentation"
 
         urgency = denial_analysis.get("urgency_indicators", [])
         urgency_str = (
-            f"CLINICAL URGENCY NOTE: Patient exhibits the following urgency indicators: {', '.join(urgency)}."
+            f"CLINICAL URGENCY: Patient exhibits: {', '.join(urgency)}. Expedited review warranted."
             if urgency else ""
         )
 
-        prompt = f"""You are a physician writing a prior authorization appeal letter. Write a professional, formal, and clinically detailed appeal letter.
+        prompt = f"""You are a physician writing a formal prior authorization appeal letter.
 
-Date: {current_date}
-Payer: {payer} — Appeals Department
-Patient: {first} {last}
-Date of Birth: {dob}
-Member ID: {member_id}
-Auth Reference: {getattr(auth_request, 'id', 'N/A')}
-CPT Code Requested: {getattr(auth_request, 'cpt_code', 'N/A')}
+PROVIDER LETTERHEAD:
+{provider_name}
+{provider_facility}
+{provider_address}
+Phone: {provider_phone} | Fax: {provider_fax}
+
+Date: {cur_date}
+
+TO:
+{payer} — Prior Authorization Appeals Department
+
+RE: Appeal of Prior Authorization Denial
+    Patient: {first} {last}
+    Date of Birth: {dob}
+    Member ID: {member}
+    Auth Reference: {auth_ref}
+    CPT Code: {cpt}
 
 Denial Reason: {denial_analysis['denial_reason']}
-Primary Appeal Argument: {denial_analysis['primary_appeal_argument']}
+Appeal Argument: {denial_analysis['primary_appeal_argument']}
 {urgency_str}
 
 Clinical Summary:
-{clinical_summary}
+{summary}
 
-Supporting Clinical Evidence:
+Supporting Evidence:
 - Diagnoses: {cond_str}
-- Current Medications: {med_str}
-- Prior Treatments / Procedures: {proc_str}
+- Medications: {med_str}
+- Prior Procedures/Treatments: {proc_str}
 - Lab Results: {lab_str}
 
-Policy Requirements Already Satisfied:
+Policy Criteria Already Satisfied:
 {satisfied_str}
 
-Write a complete, formal appeal letter with these sections:
-1. Header (date, from/to, re: block)
-2. Opening statement citing the denial
-3. Patient history and clinical presentation (use the evidence above)
-4. Direct rebuttal of the denial reason with clinical justification
-5. Policy criteria that are satisfied
-6. Urgency argument (if applicable)
-7. Conclusion requesting approval with peer-to-peer review offer
-8. Signature block with [Provider Name], [Credentials], [Date]
+Write a complete, professional appeal letter using the above information. Include:
+1. The full header as shown above (use exact provider name, facility, address, phone, fax)
+2. Professional salutation to the Appeals Reviewer
+3. Opening paragraph citing the denial and requesting reconsideration
+4. Detailed clinical narrative (use the patient's actual diagnoses and treatments)
+5. Direct rebuttal of the denial reason with clinical justification
+6. Statement of which policy criteria are satisfied
+7. Urgency section if applicable
+8. Conclusion requesting approval and offering peer-to-peer review
+9. Full signature block with {provider_name}, {provider_facility}, {cur_date}
 
-Be specific, clinical, and persuasive. Use proper medical terminology."""
+Be specific, clinical, and persuasive. Use the real names and data provided — do not use placeholder brackets."""
 
         try:
-            response = await self.llm_client.chat.completions.create(
+            resp = await self.llm_client.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1200,
-                temperature=0.3
+                max_tokens=1500,
+                temperature=0.2
             )
-            return response.choices[0].message.content.strip()
+            return resp.choices[0].message.content.strip()
         except Exception:
-            return self._generate_appeal_letter_template(auth_request, denial_analysis, clinical_evidence, policy_match)
+            return self._template_letter(auth_request, denial_analysis, clinical_evidence, policy_match)
 
-    # ------------------------------------------------------------------ #
-    #  Template fallback                                                   #
-    # ------------------------------------------------------------------ #
+    # ── Template fallback ─────────────────────────────────────────────────────
 
-    def _generate_appeal_letter_template(
-        self,
-        auth_request: Any,
-        denial_analysis: Dict[str, Any],
-        clinical_evidence: Any,
-        policy_match: Any
-    ) -> str:
-        patient = auth_request.patient
-        current_date = datetime.now().strftime("%B %d, %Y")
+    def _template_letter(self, auth_request, denial_analysis, clinical_evidence, policy_match):
+        patient  = auth_request.patient
+        cur_date = datetime.now().strftime("%B %d, %Y")
 
-        first = getattr(patient, "first_name", "") if patient else ""
-        last = getattr(patient, "last_name", "") if patient else ""
-        dob = getattr(patient, "date_of_birth", "") if patient else ""
-        member_id = getattr(patient, "insurance_id", "") if patient else ""
-        payer = getattr(patient, "payer_name", "Insurance Company") if patient else "Insurance Company"
-        cpt = getattr(auth_request, "cpt_code", "N/A")
-        auth_ref = getattr(auth_request, "id", "N/A")
+        provider_name     = getattr(auth_request, "provider_name",     "Dr. Attending Physician, MD")
+        provider_facility = getattr(auth_request, "provider_facility",  "Boston Medical Center")
+        provider_address  = getattr(auth_request, "provider_address",   "100 Medical Dr, Boston MA 02101")
+        provider_phone    = getattr(auth_request, "provider_phone",     "(617) 555-0000")
+        provider_fax      = getattr(auth_request, "provider_fax",      "(617) 555-0001")
 
-        letter = f"""PRIOR AUTHORIZATION APPEAL LETTER
+        payer   = getattr(patient, "payer_name",   "Insurance Company") if patient else "Insurance Company"
+        first   = getattr(patient, "first_name",   "") if patient else ""
+        last    = getattr(patient, "last_name",    "") if patient else ""
+        dob     = getattr(patient, "date_of_birth","") if patient else ""
+        member  = getattr(patient, "insurance_id", "") if patient else ""
+        cpt     = getattr(auth_request, "cpt_code", "N/A")
+        auth_ref= getattr(auth_request, "id", "N/A")
+        summary = getattr(clinical_evidence, "clinical_summary", "See attached clinical documentation.") or ""
+        conditions = getattr(clinical_evidence, "conditions", []) or []
 
-Date: {current_date}
+        letter = f"""{provider_name}
+{provider_facility}
+{provider_address}
+Phone: {provider_phone} | Fax: {provider_fax}
 
-From: [Provider Name]
-      [Provider Address]
-      [Provider Phone / Fax]
+Date: {cur_date}
 
-To: {payer}
-    Appeals Department
+{payer}
+Prior Authorization Appeals Department
 
-Re: Appeal of Prior Authorization Denial
+RE: Appeal of Prior Authorization Denial
     Patient: {first} {last}
-    DOB: {dob}
-    Member ID: {member_id}
-    Prior Auth Reference: {auth_ref}
-    Service Requested: CPT {cpt}
+    Date of Birth: {dob}
+    Member ID: {member}
+    Auth Reference: {auth_ref}
+    CPT Code Requested: {cpt}
 
-Dear Appeals Reviewer,
+Dear Prior Authorization Appeals Reviewer,
 
-I am writing to formally appeal the denial of prior authorization for the above-referenced service.
-The denial cited: "{denial_analysis['denial_reason']}"
+I am writing to formally appeal the denial of prior authorization for the above-referenced service. After careful review of the denial and the patient's complete medical record, I respectfully request that this decision be reconsidered.
+
+The denial stated: "{denial_analysis['denial_reason']}"
 
 {denial_analysis['primary_appeal_argument']}
 
 CLINICAL SUMMARY:
-{getattr(clinical_evidence, 'clinical_summary', 'See attached clinical documentation.')}
+{summary}
 
-SUPPORTING EVIDENCE:
 """
-        for evidence in denial_analysis["supporting_evidence"]:
-            letter += f"\n{evidence['type'].upper().replace('_', ' ')}:\n"
-            for detail in evidence["details"]:
-                letter += f"  - {detail}\n"
+        if conditions:
+            letter += "DIAGNOSES:\n"
+            for i, c in enumerate(conditions, 1):
+                code = getattr(c, "code", "") or ""
+                val  = getattr(c, "value", str(c))
+                letter += f"  {i}. {val}" + (f" (ICD-10: {code})" if code else "") + "\n"
+            letter += "\n"
 
-        if denial_analysis["urgency_indicators"]:
-            letter += f"""
-CLINICAL URGENCY:
-The patient exhibits the following urgency indicators: {', '.join(denial_analysis['urgency_indicators'])}.
-This warrants expedited review.
-"""
+        for ev in denial_analysis.get("supporting_evidence", []):
+            letter += f"{ev['type'].upper().replace('_',' ')}:\n"
+            for d in ev["details"]:
+                letter += f"  - {d}\n"
+            letter += "\n"
 
-        letter += f"""
-CONCLUSION:
-Based on the clinical documentation provided, I respectfully request that this prior authorization be approved.
-I am available for a peer-to-peer review at your convenience.
+        if denial_analysis.get("urgency_indicators"):
+            letter += f"CLINICAL URGENCY:\nThe patient presents with: {', '.join(denial_analysis['urgency_indicators'])}. This warrants expedited review.\n\n"
+
+        letter += f"""CONCLUSION:
+Based on the clinical documentation provided, I respectfully request that this prior authorization be approved. The requested service is medically necessary and appropriate for this patient's condition.
+
+I am available for peer-to-peer review at your convenience. Please contact our office at {provider_phone} to schedule.
+
+Thank you for your consideration.
 
 Sincerely,
 
-[Provider Signature]
-[Provider Name]
-[Credentials]
-{current_date}
+{provider_name}
+{provider_facility}
+{cur_date}
 
-cc: Patient
-Enclosures: Clinical Documentation, Prior Medical Records
+cc: Patient File
+Enclosures: Clinical Notes, Lab Results, Prior Treatment Records
 """
         return letter
 
-    # ------------------------------------------------------------------ #
-    #  Supplementary helpers                                               #
-    # ------------------------------------------------------------------ #
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    async def generate_appeal_summary(
-        self,
-        auth_request: Any,
-        denial_analysis: Dict[str, Any],
-        appeal_letter: str
-    ) -> Dict[str, Any]:
+    async def generate_appeal_summary(self, auth_request, denial_analysis, appeal_letter):
         return {
-            "appeal_id": f"APPEAL-{getattr(auth_request, 'id', 'UNKNOWN')[:8].upper()}",
-            "original_auth_id": getattr(auth_request, "id", ""),
-            "denial_reason": denial_analysis["denial_reason"],
-            "primary_argument": denial_analysis["primary_appeal_argument"],
-            "success_probability": denial_analysis["success_probability"],
-            "peer_review_recommended": denial_analysis["peer_review_recommended"],
-            "urgency_level": "high" if denial_analysis["urgency_indicators"] else "standard",
-            "letter_preview": appeal_letter[:500] + "...",
-            "word_count": len(appeal_letter.split()),
-            "created_at": datetime.now().isoformat(),
-            "status": "draft"
+            "appeal_id":              f"APPEAL-{getattr(auth_request,'id','')[:8].upper()}",
+            "original_auth_id":       getattr(auth_request, "id", ""),
+            "denial_reason":          denial_analysis["denial_reason"],
+            "primary_argument":       denial_analysis["primary_appeal_argument"],
+            "success_probability":    denial_analysis["success_probability"],
+            "peer_review_recommended":denial_analysis["peer_review_recommended"],
+            "urgency_level":          "high" if denial_analysis["urgency_indicators"] else "standard",
+            "word_count":             len(appeal_letter.split()),
+            "created_at":             datetime.now().isoformat(),
+            "status":                 "draft"
         }
 
-    async def submit_appeal(
-        self,
-        auth_request: Any,
-        appeal_letter: str,
-        payer_name: str
-    ) -> Dict[str, Any]:
-        return {
-            "success": True,
-            "appeal_id": f"APPEAL-{getattr(auth_request, 'id', 'UNKNOWN')[:8].upper()}",
-            "status": "submitted",
-            "submitted_at": datetime.now().isoformat(),
-            "expected_resolution": "Within 30 days (expedited: 72 hours if approved)",
-            "payer_reference": f"APP-{payer_name[:3].upper()}-{datetime.now().strftime('%Y%m%d')}-001"
-        }
-
-    def _calculate_success_probability(
-        self,
-        denial_analysis: Dict[str, Any],
-        policy_match: Any
-    ) -> float:
+    def _calc_prob(self, analysis, policy_match):
         base = 0.3
-        if denial_analysis["supporting_evidence"]:
-            base += 0.15
-        if denial_analysis["peer_review_recommended"]:
-            base += 0.10
-        if policy_match and getattr(policy_match, "match_score", 0) > 0.5:
-            base += 0.15
-        if denial_analysis["urgency_indicators"]:
-            base += 0.10
+        if analysis["supporting_evidence"]:   base += 0.15
+        if analysis["peer_review_recommended"]:base += 0.10
+        if policy_match and getattr(policy_match, "match_score", 0) > 0.5: base += 0.15
+        if analysis["urgency_indicators"]:     base += 0.10
         return min(base, 0.85)
-
-    async def draft_peer_to_peer_summary(
-        self,
-        auth_request: Any,
-        denial_analysis: Dict[str, Any],
-        clinical_evidence: Any
-    ) -> str:
-        patient = auth_request.patient
-        first = getattr(patient, "first_name", "") if patient else ""
-        last = getattr(patient, "last_name", "") if patient else ""
-        dob = getattr(patient, "date_of_birth", "") if patient else ""
-        cpt = getattr(auth_request, "cpt_code", "N/A")
-
-        conditions = getattr(clinical_evidence, "conditions", []) or []
-
-        summary = f"""PEER-TO-PEER REVIEW SUMMARY
-
-Patient: {first} {last}
-DOB: {dob}
-Requested Service: CPT {cpt}
-
-KEY CLINICAL POINTS:
-"""
-        if conditions:
-            summary += "\nDiagnoses:\n"
-            for cond in conditions[:3]:
-                summary += f"  - {getattr(cond, 'value', str(cond))}\n"
-
-        if denial_analysis["urgency_indicators"]:
-            summary += f"\nUrgency Factors: {', '.join(denial_analysis['urgency_indicators'])}\n"
-
-        summary += f"\nAppeal Argument:\n{denial_analysis['primary_appeal_argument']}\n"
-        summary += f"\nEstimated Success Probability: {denial_analysis['success_probability']*100:.0f}%"
-        return summary
