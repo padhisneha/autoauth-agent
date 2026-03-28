@@ -52,7 +52,7 @@ workflow_states: Dict[str, Dict] = {}
 
 clinical_reader  = ClinicalReaderAgent(llm_client=openai_client)
 policy_agent     = PolicyAgent(llm_client=openai_client)
-submission_agent = SubmissionAgent(mock_mode=True)
+submission_agent = SubmissionAgent(mock_mode=False)  # connects to FHIR server on :8001
 appeal_agent     = AppealAgent(llm_client=openai_client)
 
 workflow = create_workflow(clinical_reader, policy_agent, submission_agent, appeal_agent)

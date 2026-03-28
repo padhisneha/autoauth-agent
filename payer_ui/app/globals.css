@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body { @apply bg-slate-50 text-slate-900; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: hsl(210 40% 96%); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: hsl(215 20% 65%); border-radius: 3px; }

@@ -1,443 +1,332 @@
 """
 Orchestration Layer — AutoAuth Agent multi-agent workflow.
+Includes appeal resubmission to the FHIR/Payer server.
 """
 
-import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional, TypedDict
+from typing import Dict, Any, List
 from enum import Enum
 
 
 class WorkflowState(str, Enum):
-    PENDING             = "pending"
-    TRIAGE              = "triage"
-    EVIDENCE_EXTRACTION = "evidence_extraction"
-    POLICY_LOOKUP       = "policy_lookup"
-    VALIDATION          = "validation"
-    SUBMISSION          = "submission"
-    MONITORING          = "monitoring"
-    APPROVED            = "approved"
-    DENIED              = "denied"
-    APPEAL_ANALYSIS     = "appeal_analysis"
-    APPEAL_GENERATION   = "appeal_generation"
-    APPEAL_SUBMISSION   = "appeal_submission"
-    COMPLETED           = "completed"
+    PENDING               = "pending"
+    TRIAGE                = "triage"
+    EVIDENCE_EXTRACTION   = "evidence_extraction"
+    POLICY_LOOKUP         = "policy_lookup"
+    VALIDATION            = "validation"
+    SUBMISSION            = "submission"
+    MONITORING            = "monitoring"
+    APPROVED              = "approved"
+    DENIED                = "denied"
+    APPEAL_ANALYSIS       = "appeal_analysis"
+    APPEAL_GENERATION     = "appeal_generation"
+    APPEAL_SUBMISSION     = "appeal_submission"
+    APPEAL_APPROVED       = "appeal_approved"
+    APPEAL_DENIED         = "appeal_denied"
+    COMPLETED             = "completed"
     REQUIRES_HUMAN_REVIEW = "requires_human_review"
 
 
 class AgentStatus(str, Enum):
-    IDLE      = "idle"
-    RUNNING   = "running"
-    COMPLETED = "completed"
-    FAILED    = "failed"
-    WAITING   = "waiting"
+    IDLE = "idle"; RUNNING = "running"; COMPLETED = "completed"
+    FAILED = "failed"; WAITING = "waiting"
 
-
-# ── Helper: wraps a list of dicts so agents can do entity.value ──────────────
 
 class _EntityProxy:
-    """Wraps a dict (serialised ExtractedEntity) so .value, .code etc. work."""
-    def __init__(self, d: dict):
+    def __init__(self, d):
         self._d = d if isinstance(d, dict) else {}
-
-    def __getattr__(self, name):
-        try:
-            return self._d[name]
-        except KeyError:
-            return None
-
-    def __str__(self):
-        return self._d.get("value", "")
+    def __getattr__(self, n):
+        try: return self._d[n]
+        except KeyError: return None
+    def __str__(self): return self._d.get("value", "")
 
 
 class _EvidenceProxy:
-    """
-    Wraps the serialised clinical_evidence dict produced by workflow state.
-    Ensures agents can do evidence.conditions[0].value without crashing.
-    """
-    def __init__(self, data: dict):
+    def __init__(self, data):
         self._data = data if isinstance(data, dict) else {}
-
     @property
-    def clinical_summary(self) -> str:
-        return self._data.get("clinical_summary", "")
-
+    def clinical_summary(self): return self._data.get("clinical_summary", "")
     @property
-    def extraction_confidence(self) -> float:
-        return float(self._data.get("extraction_confidence", 0.5))
-
-    def _wrap_list(self, key: str) -> list:
-        raw = self._data.get(key) or []
-        return [_EntityProxy(x) if isinstance(x, dict) else x for x in raw]
-
+    def extraction_confidence(self): return float(self._data.get("extraction_confidence", 0.5))
+    def _wrap(self, key):
+        return [_EntityProxy(x) if isinstance(x, dict) else x for x in (self._data.get(key) or [])]
     @property
-    def conditions(self):   return self._wrap_list("conditions")
+    def conditions(self):  return self._wrap("conditions")
     @property
-    def procedures(self):   return self._wrap_list("procedures")
+    def procedures(self):  return self._wrap("procedures")
     @property
-    def medications(self):  return self._wrap_list("medications")
+    def medications(self): return self._wrap("medications")
     @property
-    def lab_results(self):  return self._wrap_list("lab_results")
+    def lab_results(self): return self._wrap("lab_results")
     @property
-    def vital_signs(self):  return self._wrap_list("vital_signs")
+    def vital_signs(self): return self._wrap("vital_signs")
     @property
-    def allergies(self):    return self._wrap_list("allergies")
+    def allergies(self):   return self._wrap("allergies")
 
 
-class _PolicyMatchProxy:
-    """Wraps the serialised policy_match dict."""
-    def __init__(self, data: dict):
-        self._d = data if isinstance(data, dict) else {}
-
-    def __getattr__(self, name):
-        try:
-            return self._d[name]
-        except KeyError:
-            return None
-
+class _PolicyProxy:
+    def __init__(self, d):
+        self._d = d if isinstance(d, dict) else {}
+    def __getattr__(self, n):
+        try: return self._d[n]
+        except KeyError: return None
     @property
-    def is_covered(self) -> bool:
-        return bool(self._d.get("is_covered", False))
-
+    def is_covered(self): return bool(self._d.get("is_covered", False))
     @property
-    def match_score(self) -> float:
-        return float(self._d.get("match_score", 0.0))
-
+    def match_score(self): return float(self._d.get("match_score", 0.0))
     @property
-    def policy_name(self) -> str:
-        return self._d.get("policy_name", "")
-
+    def policy_name(self): return self._d.get("policy_name", "")
     @property
-    def satisfied_requirements(self) -> list:
-        return self._d.get("satisfied_requirements", [])
-
+    def satisfied_requirements(self): return self._d.get("satisfied_requirements", [])
     @property
-    def missing_requirements(self) -> list:
-        return self._d.get("missing_requirements", [])
+    def missing_requirements(self): return self._d.get("missing_requirements", [])
 
-
-# ── Main workflow class ───────────────────────────────────────────────────────
 
 class AuthorizationWorkflow:
-    def __init__(self, clinical_reader_agent, policy_agent, submission_agent, appeal_agent):
-        self.clinical_reader = clinical_reader_agent
-        self.policy          = policy_agent
-        self.submission      = submission_agent
-        self.appeal          = appeal_agent
+    def __init__(self, clinical_reader, policy, submission, appeal):
+        self.clinical_reader = clinical_reader
+        self.policy = policy
+        self.submission = submission
+        self.appeal = appeal
 
-    async def execute_workflow(
-        self,
-        auth_request: Any,
-        clinical_notes: List[Any],
-        callback=None
-    ) -> Dict[str, Any]:
-
-        state = self._initialize_state(auth_request)
-
+    async def execute_workflow(self, auth_request, clinical_notes, callback=None):
+        state = self._init(auth_request)
         try:
-            state = await self._stage_triage(state, callback)
-            state = await self._stage_evidence_extraction(state, clinical_notes, callback)
-            state = await self._stage_policy_lookup(state, auth_request, callback)
-            state = await self._stage_validation(state, callback)
-            state = await self._stage_submission(state, auth_request, callback)
-            state = await self._stage_monitoring(state, callback)
+            state = await self._triage(state, callback)
+            state = await self._evidence(state, clinical_notes, callback)
+            state = await self._policy_lookup(state, auth_request, callback)
+            state = await self._validation(state, callback)
+            state = await self._submission(state, auth_request, callback)
+            state = await self._monitoring(state, callback)
 
             if state["current_state"] == WorkflowState.DENIED:
-                state = await self._handle_denial(state, auth_request, callback)
+                state = await self._appeal_generate(state, auth_request, callback)
+                state = await self._appeal_submit(state, auth_request, callback)
 
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()
-            print(f"[WORKFLOW EXCEPTION] {tb}")
+            print(f"[WORKFLOW ERROR]\n{traceback.format_exc()}")
             state["error"] = str(e)
             state["current_state"] = WorkflowState.REQUIRES_HUMAN_REVIEW
-            state = self._log_event(state, "error", {"error": str(e), "traceback": tb})
-            if callback:
-                await callback(state)
+            state = self._log(state, "error", {"error": str(e)})
+            if callback: await callback(state)
 
-        return self._compile_results(state)
+        return self._compile(state)
 
-    # ── Stage implementations ─────────────────────────────────────────────────
+    # ── Stages ──────────────────────────────────────────────────────────────
 
-    async def _stage_triage(self, state, callback=None):
-        self._start_agent(state, "TriageAgent")
-        is_urgent = "urgent" in str(state.get("service_type", "")).lower()
+    async def _triage(self, state, cb):
+        self._start(state, "TriageAgent")
+        urgent = "urgent" in str(state.get("service_type", "")).lower()
         state["current_state"] = WorkflowState.TRIAGE
-        self._complete_agent(state, "TriageAgent", {"is_urgent": is_urgent, "priority": "urgent" if is_urgent else "standard"})
-        state = self._log_event(state, "triage_completed", {"is_urgent": is_urgent})
-        if callback: await callback(state)
+        self._done(state, "TriageAgent", {"is_urgent": urgent})
+        state = self._log(state, "triage_completed", {"is_urgent": urgent})
+        if cb: await cb(state)
         return state
 
-    async def _stage_evidence_extraction(self, state, clinical_notes, callback=None):
-        self._start_agent(state, "ClinicalReaderAgent")
-
-        clinical_evidence = await self.clinical_reader.extract_clinical_evidence(
-            clinical_notes,
-            state["patient_id"],
-            state["service_type"],
-            state["cpt_code"]
-        )
-
-        necessity_analysis = await self.clinical_reader.analyze_medical_necessity(
-            clinical_evidence,
-            state["service_type"],
-            state["cpt_code"]
-        )
-
-        # Store as serialisable dict
-        evidence_dict = clinical_evidence.model_dump() if hasattr(clinical_evidence, "model_dump") else vars(clinical_evidence)
-        state["clinical_evidence"] = {
-            "evidence": evidence_dict,
-            "necessity_analysis": necessity_analysis
-        }
+    async def _evidence(self, state, notes, cb):
+        self._start(state, "ClinicalReaderAgent")
+        ev = await self.clinical_reader.extract_clinical_evidence(
+            notes, state["patient_id"], state["service_type"], state["cpt_code"])
+        na = await self.clinical_reader.analyze_medical_necessity(
+            ev, state["service_type"], state["cpt_code"])
+        ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else vars(ev)
+        state["clinical_evidence"] = {"evidence": ev_dict, "necessity_analysis": na}
         state["current_state"] = WorkflowState.EVIDENCE_EXTRACTION
-
-        self._complete_agent(state, "ClinicalReaderAgent", {
-            "conditions_found": len(clinical_evidence.conditions),
-            "confidence": clinical_evidence.extraction_confidence,
-            "summary": (clinical_evidence.clinical_summary or "")[:200]
+        self._done(state, "ClinicalReaderAgent", {
+            "conditions_found": len(ev.conditions),
+            "confidence": ev.extraction_confidence,
+            "summary": (ev.clinical_summary or "")[:200]
         })
-        state = self._log_event(state, "evidence_extraction_completed", {
-            "conditions": len(clinical_evidence.conditions),
-            "confidence": clinical_evidence.extraction_confidence
-        })
-        if callback: await callback(state)
+        state = self._log(state, "evidence_done", {"conditions": len(ev.conditions)})
+        if cb: await cb(state)
         return state
 
-    async def _stage_policy_lookup(self, state, auth_request, callback=None):
-        self._start_agent(state, "PolicyAgent")
-
-        payer_name = "Blue Cross Blue Shield"
-        if auth_request.patient:
-            payer_name = getattr(auth_request.patient, "payer_name", payer_name)
-
-        policy_req = await self.policy.retrieve_policy_requirements(
-            payer_name,
-            state["service_type"],
-            state["cpt_code"]
-        )
-
-        # Use the proxy to safely wrap the serialised evidence
-        evidence_dict = state.get("clinical_evidence", {}).get("evidence", {})
-        evidence_proxy = _EvidenceProxy(evidence_dict)
-
-        policy_match = await self.policy.match_policy(
-            evidence_proxy,
-            policy_req,
-            payer_name
-        )
-
-        state["policy_requirements"] = policy_req.model_dump() if hasattr(policy_req, "model_dump") else {}
-        state["policy_match"]        = policy_match.model_dump() if hasattr(policy_match, "model_dump") else {}
+    async def _policy_lookup(self, state, auth_req, cb):
+        self._start(state, "PolicyAgent")
+        payer = getattr(getattr(auth_req, "patient", None), "payer_name", "Blue Cross Blue Shield")
+        req = await self.policy.retrieve_policy_requirements(payer, state["service_type"], state["cpt_code"])
+        ev  = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
+        pm  = await self.policy.match_policy(ev, req, payer)
+        state["policy_requirements"] = req.model_dump() if hasattr(req, "model_dump") else {}
+        state["policy_match"] = pm.model_dump() if hasattr(pm, "model_dump") else {}
         state["current_state"] = WorkflowState.POLICY_LOOKUP
-
-        self._complete_agent(state, "PolicyAgent", {
-            "policy_id":   policy_req.requirement_id,
-            "match_score": policy_match.match_score,
-            "is_covered":  policy_match.is_covered
-        })
-        state = self._log_event(state, "policy_lookup_completed", {
-            "match_score": policy_match.match_score,
-            "is_covered":  policy_match.is_covered
-        })
-        if callback: await callback(state)
+        self._done(state, "PolicyAgent", {"match_score": pm.match_score, "is_covered": pm.is_covered})
+        state = self._log(state, "policy_done", {"match_score": pm.match_score})
+        if cb: await cb(state)
         return state
 
-    async def _stage_validation(self, state, callback=None):
-        self._start_agent(state, "ValidationAgent")
-
-        issues = []
-        if not state.get("clinical_evidence"):
-            issues.append("Missing clinical evidence")
-        if not state.get("policy_match"):
-            issues.append("Missing policy match")
-
-        # Always proceed to submission even if policy not fully met
+    async def _validation(self, state, cb):
+        self._start(state, "ValidationAgent")
         state["current_state"] = WorkflowState.VALIDATION
-
-        self._complete_agent(state, "ValidationAgent", {
-            "issues": issues,
-            "can_proceed": True  # always submit; payer makes the final decision
-        })
-        state = self._log_event(state, "validation_completed", {"issues": issues})
-        if callback: await callback(state)
+        self._done(state, "ValidationAgent", {"can_proceed": True})
+        state = self._log(state, "validation_done", {})
+        if cb: await cb(state)
         return state
 
-    async def _stage_submission(self, state, auth_request, callback=None):
-        self._start_agent(state, "SubmissionAgent")
+    async def _submission(self, state, auth_req, cb):
+        self._start(state, "SubmissionAgent")
+        ev = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
+        pm = _PolicyProxy(state.get("policy_match", {}))
 
-        evidence_dict  = state.get("clinical_evidence", {}).get("evidence", {})
-        evidence_proxy = _EvidenceProxy(evidence_dict)
-        policy_dict    = state.get("policy_match", {})
-        policy_proxy   = _PolicyMatchProxy(policy_dict)
+        class _Auth:
+            def __init__(self, s, a):
+                self.id = s["auth_id"]; self.patient_id = s["patient_id"]
+                self.cpt_code = s["cpt_code"]; self.patient = a.patient
+                self.policy_match = pm
 
-        # Build a minimal mock auth for the submission agent
-        class _SubmissionAuth:
-            def __init__(self, s, auth):
-                self.id          = s["auth_id"]
-                self.patient_id  = s["patient_id"]
-                self.cpt_code    = s["cpt_code"]
-                self.patient     = auth.patient
-                self.policy_match = policy_proxy   # ← was missing before
-
-        submission_auth = _SubmissionAuth(state, auth_request)
-
-        fhir_bundle = await self.submission.build_fhir_bundle(
-            submission_auth, evidence_proxy, policy_proxy
-        )
-
-        submission_result = await self.submission.submit_prior_authorization(
-            submission_auth, fhir_bundle
-        )
-
-        state["fhir_bundle"]       = fhir_bundle
-        state["submission_result"] = submission_result
-        state["current_state"]     = WorkflowState.SUBMISSION
-
-        self._complete_agent(state, "SubmissionAgent", {
-            "external_id": submission_result.get("external_auth_id"),
-            "status":      submission_result.get("status")
+        sa = _Auth(state, auth_req)
+        bundle = await self.submission.build_fhir_bundle(sa, ev, pm)
+        result = await self.submission.submit_prior_authorization(sa, bundle)
+        state["fhir_bundle"] = bundle
+        state["submission_result"] = result
+        state["current_state"] = WorkflowState.SUBMISSION
+        self._done(state, "SubmissionAgent", {
+            "external_id": result.get("external_auth_id"),
+            "claim_id": result.get("claim_response_id"),
+            "status": result.get("status")
         })
-        state = self._log_event(state, "submission_completed", {
-            "external_id": submission_result.get("external_auth_id"),
-            "status":      submission_result.get("status")
-        })
-        if callback: await callback(state)
+        state = self._log(state, "submission_done", {"status": result.get("status")})
+        if cb: await cb(state)
         return state
 
-    async def _stage_monitoring(self, state, callback=None):
-        self._start_agent(state, "MonitoringAgent")
-
-        result   = state.get("submission_result", {})
-        decision = result.get("decision", {})
-        outcome  = decision.get("outcome") or result.get("status") or "pending"
-        outcome  = str(outcome).lower()
+    async def _monitoring(self, state, cb):
+        self._start(state, "MonitoringAgent")
+        res = state.get("submission_result", {})
+        dec = res.get("decision", {})
+        outcome = str(dec.get("outcome") or res.get("status") or "approved").lower()
 
         if outcome == "approved":
             state["current_state"] = WorkflowState.APPROVED
-        elif outcome == "denied":
+        else:
             state["current_state"] = WorkflowState.DENIED
             state["denial_analysis"] = {
-                "denial_reason": decision.get("reason") or "Service not medically necessary"
+                "denial_reason": dec.get("reason") or "Service not medically necessary"
             }
-        else:
-            # pending → treat as approved for demo so UI doesn't hang
-            state["current_state"] = WorkflowState.APPROVED
 
-        self._complete_agent(state, "MonitoringAgent", {"decision": outcome})
-        state = self._log_event(state, "decision_received", {"outcome": outcome})
-        if callback: await callback(state)
+        self._done(state, "MonitoringAgent", {"decision": outcome})
+        state = self._log(state, "decision_received", {"outcome": outcome})
+        if cb: await cb(state)
         return state
 
-    async def _handle_denial(self, state, auth_request, callback=None):
-        denial_reason  = state.get("denial_analysis", {}).get("denial_reason", "Service not medically necessary")
-        evidence_dict  = state.get("clinical_evidence", {}).get("evidence", {})
-        evidence_proxy = _EvidenceProxy(evidence_dict)
-        policy_dict    = state.get("policy_match", {})
-        policy_proxy   = _PolicyMatchProxy(policy_dict)
+    async def _appeal_generate(self, state, auth_req, cb):
+        """Analyse denial and generate an LLM appeal letter."""
+        denial = state.get("denial_analysis", {}).get("denial_reason", "Not medically necessary")
+        ev  = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
+        pm  = _PolicyProxy(state.get("policy_match", {}))
 
-        denial_analysis = await self.appeal.analyze_denial(
-            auth_request, denial_reason, evidence_proxy, policy_proxy
-        )
-        state["denial_analysis"] = denial_analysis
+        analysis = await self.appeal.analyze_denial(auth_req, denial, ev, pm)
+        state["denial_analysis"] = analysis
         state["current_state"]   = WorkflowState.APPEAL_ANALYSIS
+        if cb: await cb(state)
 
-        state = await self._generate_appeal(state, auth_request, callback)
-        return state
-
-    async def _generate_appeal(self, state, auth_request, callback=None):
-        self._start_agent(state, "AppealAgent")
-
-        denial_analysis = state.get("denial_analysis", {})
-        evidence_proxy  = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
-        policy_proxy    = _PolicyMatchProxy(state.get("policy_match", {}))
-
-        appeal_letter = await self.appeal.generate_appeal_letter(
-            auth_request, denial_analysis, evidence_proxy, policy_proxy
-        )
-
-        state["appeal_letter"]   = appeal_letter
+        self._start(state, "AppealAgent")
+        letter = await self.appeal.generate_appeal_letter(auth_req, analysis, ev, pm)
+        state["appeal_letter"]   = letter
         state["current_state"]   = WorkflowState.APPEAL_GENERATION
-
-        self._complete_agent(state, "AppealAgent", {
-            "word_count":         len(appeal_letter.split()),
-            "success_probability": denial_analysis.get("success_probability", 0.5)
+        self._done(state, "AppealAgent", {
+            "word_count": len(letter.split()),
+            "success_probability": analysis.get("success_probability", 0.5)
         })
-        state = self._log_event(state, "appeal_generated", {"word_count": len(appeal_letter.split())})
-        if callback: await callback(state)
+        state = self._log(state, "appeal_generated", {"word_count": len(letter.split())})
+        if cb: await cb(state)
         return state
 
-    # ── Agent lifecycle helpers ───────────────────────────────────────────────
+    async def _appeal_submit(self, state, auth_req, cb):
+        """Submit the appeal (with letter) back to the FHIR/Payer server."""
+        self._start(state, "AppealSubmissionAgent")
+        state["current_state"] = WorkflowState.APPEAL_SUBMISSION
+        if cb: await cb(state)
 
-    def _start_agent(self, state, agent_name: str):
-        state["agents"][agent_name] = {
-            "name": agent_name,
-            "status": AgentStatus.RUNNING,
-            "start_time": datetime.now(),
-            "end_time": None,
-            "input_data": {},
-            "output_data": {},
-            "reasoning_steps": [],
-            "error": None,
-            "tokens_used": 0
+        pm = _PolicyProxy(state.get("policy_match", {}))
+
+        class _AppealAuth:
+            def __init__(self, s, a):
+                self.id = s["auth_id"] + "-APPEAL"
+                self.patient_id = s["patient_id"]
+                self.cpt_code = s["cpt_code"]
+                self.patient = a.patient
+                self.policy_match = pm
+
+        aa = _AppealAuth(state, auth_req)
+        result = await self.submission.submit_appeal(
+            aa,
+            state.get("fhir_bundle", {}),
+            state.get("appeal_letter", "")
+        )
+        state["appeal_submission_result"] = result
+        # Final state depends on whether FHIR server is live; keep as APPEAL_SUBMISSION
+        # so the frontend shows it clearly
+        state["current_state"] = WorkflowState.APPEAL_SUBMISSION
+
+        self._done(state, "AppealSubmissionAgent", {
+            "claim_id": result.get("claim_response_id"),
+            "status":   result.get("status", "submitted"),
+            "message":  result.get("message", "Appeal submitted to payer for review")
+        })
+        state = self._log(state, "appeal_submitted", {"claim_id": result.get("claim_response_id")})
+        if cb: await cb(state)
+        return state
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _start(self, state, name):
+        state["agents"][name] = {
+            "name": name, "status": AgentStatus.RUNNING,
+            "start_time": datetime.now(), "end_time": None,
+            "input_data": {}, "output_data": {}, "reasoning_steps": [],
+            "error": None, "tokens_used": 0
         }
         state["updated_at"] = datetime.now()
 
-    def _complete_agent(self, state, agent_name: str, output: dict):
-        if agent_name in state["agents"]:
-            state["agents"][agent_name]["status"]      = AgentStatus.COMPLETED
-            state["agents"][agent_name]["end_time"]    = datetime.now()
-            state["agents"][agent_name]["output_data"] = output
+    def _done(self, state, name, output):
+        if name in state["agents"]:
+            state["agents"][name]["status"]      = AgentStatus.COMPLETED
+            state["agents"][name]["end_time"]    = datetime.now()
+            state["agents"][name]["output_data"] = output
         state["updated_at"] = datetime.now()
 
-    def _log_event(self, state, event_type: str, data: dict):
+    def _log(self, state, event, data):
         state["processing_log"].append({
-            "timestamp":  datetime.now().isoformat(),
-            "event_type": event_type,
-            "state":      str(state["current_state"]),
-            "data":       data
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event,
+            "state": str(state["current_state"]),
+            "data": data
         })
         return state
 
-    def _initialize_state(self, auth_request) -> dict:
+    def _init(self, auth_req):
         return {
-            "auth_id":              auth_request.id,
-            "patient_id":           auth_request.patient_id,
-            "service_type":         auth_request.service_type,
-            "cpt_code":             auth_request.cpt_code,
-            "icd10_code":           auth_request.icd10_code,
-            "current_state":        WorkflowState.PENDING,
-            "target_state":         None,
-            "clinical_evidence":    None,
-            "policy_requirements":  None,
-            "policy_match":         None,
-            "fhir_bundle":          None,
-            "submission_result":    None,
-            "denial_analysis":      None,
-            "appeal_letter":        None,
-            "agents":               {},
-            "error":                None,
-            "created_at":           datetime.now(),
-            "updated_at":           datetime.now(),
-            "processing_log":       []
+            "auth_id": auth_req.id, "patient_id": auth_req.patient_id,
+            "service_type": auth_req.service_type, "cpt_code": auth_req.cpt_code,
+            "icd10_code": auth_req.icd10_code,
+            "current_state": WorkflowState.PENDING, "target_state": None,
+            "clinical_evidence": None, "policy_requirements": None,
+            "policy_match": None, "fhir_bundle": None,
+            "submission_result": None, "denial_analysis": None,
+            "appeal_letter": None, "appeal_submission_result": None,
+            "agents": {}, "error": None,
+            "created_at": datetime.now(), "updated_at": datetime.now(),
+            "processing_log": []
         }
 
-    def _compile_results(self, state: dict) -> dict:
+    def _compile(self, state):
         return {
-            "auth_id":          state["auth_id"],
-            "status":           state["current_state"],
-            "current_state":    state["current_state"],
+            "auth_id": state["auth_id"],
+            "status": state["current_state"],
+            "current_state": state["current_state"],
             "clinical_evidence": state.get("clinical_evidence"),
-            "policy_match":      state.get("policy_match"),
+            "policy_match": state.get("policy_match"),
             "submission_result": state.get("submission_result"),
-            "denial_analysis":   state.get("denial_analysis"),
-            "appeal_letter":     state.get("appeal_letter"),
-            "agents":            state["agents"],
-            "processing_log":    state["processing_log"],
-            "error":             state.get("error"),
-            "completed_at":      datetime.now().isoformat()
+            "denial_analysis": state.get("denial_analysis"),
+            "appeal_letter": state.get("appeal_letter"),
+            "appeal_submission_result": state.get("appeal_submission_result"),
+            "agents": state["agents"],
+            "processing_log": state["processing_log"],
+            "error": state.get("error"),
+            "completed_at": datetime.now().isoformat()
         }
 
 
-def create_workflow(clinical_reader, policy, submission, appeal):
-    return AuthorizationWorkflow(clinical_reader, policy, submission, appeal)
+def create_workflow(cr, policy, submission, appeal):
+    return AuthorizationWorkflow(cr, policy, submission, appeal)

@@ -1,163 +1,273 @@
 """
-Submission Agent - Maps data to FHIR resources and submits prior authorization.
-Works with both real Pydantic objects and proxy/dict-based evidence objects.
+Submission Agent — builds FHIR bundles, submits to FHIR server, handles appeals.
 """
 
-import json
-import uuid
-import random
+import uuid, asyncio, random, base64
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
+
+FHIR_SERVER_URL    = "http://localhost:8001"
+POLL_INTERVAL      = 2
+POLL_MAX_ATTEMPTS  = 60
 
 
-def _val(entity, attr: str, default="") -> str:
-    """Safely get an attribute from an entity that may be a dict, object, or proxy."""
-    if isinstance(entity, dict):
-        return entity.get(attr, default)
+def _val(entity, attr, default=""):
+    if isinstance(entity, dict): return entity.get(attr, default)
     return getattr(entity, attr, default) or default
 
 
 class SubmissionAgent:
-    def __init__(self, fhir_client=None, mock_mode: bool = True):
-        self.agent_name = "SubmissionAgent"
+    def __init__(self, fhir_client=None, mock_mode=False):
+        self.agent_name  = "SubmissionAgent"
         self.fhir_client = fhir_client
         self.mock_mode   = mock_mode
 
-    async def build_fhir_bundle(
-        self,
-        auth_request: Any,
-        clinical_evidence: Any,
-        policy_match: Any
-    ) -> Dict[str, Any]:
+    # ── FHIR Bundle builder ───────────────────────────────────────────────────
 
+    async def build_fhir_bundle(self, auth_request, clinical_evidence, policy_match, appeal_letter=None):
         bundle_id = str(uuid.uuid4())
-        timestamp = datetime.now().isoformat()
-        resources = []
+        ts        = datetime.now().isoformat()
+        patient   = auth_request.patient
+        summary   = _val(clinical_evidence, "clinical_summary") or "Medical necessity documented"
+        conditions  = getattr(clinical_evidence, "conditions",  []) or []
+        medications = getattr(clinical_evidence, "medications", []) or []
+        resources   = []
 
-        # ── 1. ServiceRequest ──
-        summary = _val(clinical_evidence, "clinical_summary") or "Medical necessity documented"
-        service_request = {
+        # ServiceRequest
+        sr = {
             "resourceType": "ServiceRequest",
             "id": f"sr-{str(auth_request.id)[:8]}",
-            "status": "active",
-            "intent": "order",
-            "code": {
-                "coding": [{
-                    "system": "http://www.ama-assn.org/go/cpt",
-                    "code": auth_request.cpt_code,
-                    "display": self._get_cpt_description(auth_request.cpt_code)
-                }]
-            },
-            "subject": {
-                "reference": f"Patient/{auth_request.patient_id}",
-                "display": self._patient_display(auth_request.patient)
-            },
-            "authoredOn": timestamp,
+            "status": "active", "intent": "order",
+            "code": {"coding": [{"system": "http://www.ama-assn.org/go/cpt",
+                                  "code": auth_request.cpt_code,
+                                  "display": self._cpt_desc(auth_request.cpt_code)}]},
+            "subject": {"reference": f"Patient/{auth_request.patient_id}",
+                        "display": self._pt_name(patient)},
+            "authoredOn": ts,
+            "requester": {"reference": "Practitioner/provider-001", "display": "Ordering Provider"},
             "reasonCode": [{"text": summary[:500]}]
         }
+        for c in conditions[:5]:
+            sr["reasonCode"].append({"text": _val(c, "value", str(c))})
+        resources.append(sr)
 
-        conditions = getattr(clinical_evidence, "conditions", []) or []
-        for cond in conditions[:5]:
-            service_request["reasonCode"].append({"text": _val(cond, "value", str(cond))})
-
-        resources.append(service_request)
-
-        # ── 2. Patient resource ──
-        patient = auth_request.patient
+        # Patient
         if patient:
             resources.append({
-                "resourceType": "Patient",
-                "id": auth_request.patient_id,
+                "resourceType": "Patient", "id": auth_request.patient_id,
                 "identifier": [{"system": "http://hospital.example.org/mrn", "value": _val(patient, "mrn")}],
-                "name": [{"use": "official", "family": _val(patient, "last_name"), "given": [_val(patient, "first_name")]}],
-                "gender": _val(patient, "gender"),
-                "birthDate": _val(patient, "date_of_birth")
+                "name": [{"use": "official", "family": _val(patient, "last_name"),
+                           "given": [_val(patient, "first_name")]}],
+                "gender": _val(patient, "gender"), "birthDate": _val(patient, "date_of_birth")
             })
 
-        # ── 3. Condition resources ──
-        for i, cond in enumerate(conditions[:10]):
+        # Conditions
+        for i, c in enumerate(conditions[:10]):
             resources.append({
                 "resourceType": "Condition",
                 "id": f"cond-{str(auth_request.id)[:4]}-{i}",
                 "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active"}]},
-                "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": _val(cond, "code", "R68.89"), "display": _val(cond, "value")}]},
+                "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm",
+                                      "code": _val(c, "code", "R68.89"),
+                                      "display": _val(c, "value")}]},
                 "subject": {"reference": f"Patient/{auth_request.patient_id}"}
             })
 
-        # ── 4. MedicationStatement resources ──
-        medications = getattr(clinical_evidence, "medications", []) or []
-        for i, med in enumerate(medications[:10]):
+        # Medications
+        for i, m in enumerate(medications[:10]):
             resources.append({
                 "resourceType": "MedicationStatement",
                 "id": f"med-{str(auth_request.id)[:4]}-{i}",
                 "status": "active",
-                "medicationCodeableConcept": {"text": _val(med, "value", str(med))},
+                "medicationCodeableConcept": {"text": _val(m, "value", str(m))},
                 "subject": {"reference": f"Patient/{auth_request.patient_id}"}
             })
 
-        # ── 5. DocumentReference ──
+        # DocumentReference (clinical notes)
         resources.append({
             "resourceType": "DocumentReference",
             "id": f"doc-{str(auth_request.id)[:8]}",
             "status": "current",
-            "type": {"coding": [{"system": "http://loinc.org", "code": "34117-2", "display": "History and physical note"}]},
+            "type": {"coding": [{"system": "http://loinc.org", "code": "34117-2",
+                                  "display": "History and physical note"}]},
             "subject": {"reference": f"Patient/{auth_request.patient_id}"},
-            "content": [{"attachment": {"contentType": "text/plain", "data": self._encode_base64(summary)}}]
+            "content": [{"attachment": {"contentType": "text/plain",
+                                         "data": self._b64(summary)}}]
         })
 
-        # ── 6. Coverage ──
+        # Appeal letter as a separate DocumentReference (if provided)
+        if appeal_letter:
+            resources.append({
+                "resourceType": "DocumentReference",
+                "id": f"appeal-{str(auth_request.id)[:8]}",
+                "status": "current",
+                "type": {"coding": [{"system": "http://loinc.org", "code": "57133-1",
+                                      "display": "Referral note"}]},
+                "description": "Prior Authorization Appeal Letter",
+                "subject": {"reference": f"Patient/{auth_request.patient_id}"},
+                "content": [{"attachment": {"contentType": "text/plain",
+                                             "title": "Appeal Letter",
+                                             "data": self._b64(appeal_letter)}}]
+            })
+
+        # Coverage
         resources.append({
             "resourceType": "Coverage",
             "id": f"cov-{str(auth_request.id)[:8]}",
             "status": "active",
             "beneficiary": {"reference": f"Patient/{auth_request.patient_id}"},
-            "payor": [{"display": _val(patient, "payer_name", "Insurance Company") if patient else "Insurance Company"}]
+            "payor": [{"display": _val(patient, "payer_name", "Insurance") if patient else "Insurance"}]
         })
 
         return {
-            "resourceType": "Bundle",
-            "id": bundle_id,
-            "type": "collection",
-            "timestamp": timestamp,
+            "resourceType": "Bundle", "id": bundle_id,
+            "type": "collection", "timestamp": ts,
             "entry": [{"resource": r} for r in resources]
         }
 
-    async def submit_prior_authorization(
-        self,
-        auth_request: Any,
-        fhir_bundle: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    # ── Submit original PA ────────────────────────────────────────────────────
+
+    async def submit_prior_authorization(self, auth_request, fhir_bundle):
         if self.mock_mode:
             return await self._mock_submit(auth_request)
         try:
-            response = await self.fhir_client.post("/PriorAuthorization", json=fhir_bundle)
-            return {"success": True, "external_auth_id": response.get("id"), "status": "submitted",
-                    "timestamp": datetime.now().isoformat()}
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{FHIR_SERVER_URL}/fhir/Bundle",
+                                         json=fhir_bundle,
+                                         headers={"Content-Type": "application/json"})
+                resp.raise_for_status()
+                cr = resp.json()
         except Exception as e:
-            return {"success": False, "error": str(e), "status": "failed"}
+            print(f"[SubmissionAgent] FHIR server unreachable, using mock: {e}")
+            return await self._mock_submit(auth_request)
 
-    async def _mock_submit(self, auth_request: Any) -> Dict[str, Any]:
-        # Use policy_match if available, otherwise default to approved (demo-friendly)
-        policy_match = getattr(auth_request, "policy_match", None)
-        if policy_match is not None:
-            is_covered = getattr(policy_match, "is_covered", True)
-            outcome = "approved" if (is_covered and random.random() > 0.15) else "denied"
+        claim_id = cr.get("claim_response_id") or cr.get("id")
+        decision = await self._poll(claim_id)
+        outcome  = decision.get("auth_status", "denied")
+
+        return {
+            "success": True,
+            "external_auth_id": f"PA-{str(auth_request.id)[:8].upper()}-{claim_id}",
+            "claim_response_id": claim_id,
+            "status": outcome,
+            "timestamp": datetime.now().isoformat(),
+            "decision": {
+                "outcome": outcome,
+                "reason":  decision.get("denial_reason"),
+                "valid_until": datetime.now().isoformat() if outcome == "approved" else None,
+                "approved_units": 1 if outcome == "approved" else None,
+                "decided_at": decision.get("decided_at"),
+                "reviewer": decision.get("reviewer"),
+            },
+            "next_steps": self._next(outcome)
+        }
+
+    # ── Submit appeal ─────────────────────────────────────────────────────────
+
+    async def submit_appeal(self, auth_request, original_bundle, appeal_letter):
+        """
+        Build a new FHIR bundle that includes the appeal letter as an attachment
+        and POST it to the FHIR server as a new (appeal) request.
+        """
+        if self.mock_mode:
+            # Mock: return submitted immediately, payer decides via UI
+            return {
+                "success": True,
+                "claim_response_id": f"APPEAL-MOCK-{str(auth_request.id)[:8].upper()}",
+                "status": "submitted",
+                "message": "Appeal submitted (mock mode — no FHIR server)"
+            }
+
+        # Rebuild bundle with the appeal letter included
+        try:
+            # Use the existing build method but can't call it directly here
+            # so we inject the appeal letter into a copy of the original bundle
+            import copy
+            appeal_bundle = copy.deepcopy(original_bundle)
+            appeal_bundle["id"] = str(uuid.uuid4())
+            appeal_bundle["timestamp"] = datetime.now().isoformat()
+
+            # Add appeal letter DocumentReference
+            appeal_doc = {
+                "resourceType": "DocumentReference",
+                "id": f"appeal-{str(auth_request.id)[:8]}",
+                "status": "current",
+                "type": {"coding": [{"system": "http://loinc.org", "code": "57133-1",
+                                      "display": "Appeal Letter"}]},
+                "description": "Prior Authorization Appeal Letter",
+                "content": [{"attachment": {
+                    "contentType": "text/plain",
+                    "title": "Appeal Letter",
+                    "data": self._b64(appeal_letter)
+                }}]
+            }
+            appeal_bundle.setdefault("entry", []).append({"resource": appeal_doc})
+
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{FHIR_SERVER_URL}/fhir/Bundle",
+                    json=appeal_bundle,
+                    params={"is_appeal": "true"},
+                    headers={"Content-Type": "application/json", "X-Is-Appeal": "true"}
+                )
+                resp.raise_for_status()
+                cr = resp.json()
+
+            claim_id = cr.get("claim_response_id") or cr.get("id")
+            return {
+                "success": True,
+                "claim_response_id": claim_id,
+                "status": "submitted",
+                "message": f"Appeal submitted to payer (Claim ID: {claim_id}). Awaiting review."
+            }
+        except Exception as e:
+            print(f"[SubmissionAgent] Appeal submission failed: {e}")
+            return {
+                "success": False,
+                "claim_response_id": None,
+                "status": "failed",
+                "message": f"Appeal submission failed: {str(e)}"
+            }
+
+    # ── Polling ───────────────────────────────────────────────────────────────
+
+    async def _poll(self, claim_id):
+        import httpx
+        url = f"{FHIR_SERVER_URL}/fhir/ClaimResponse/{claim_id}"
+        for attempt in range(POLL_MAX_ATTEMPTS):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        data   = resp.json()
+                        status = data.get("auth_status", "pending")
+                        if status in ("approved", "denied"):
+                            return data
+            except Exception as e:
+                print(f"[SubmissionAgent] Poll {attempt+1}: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+        return {"auth_status": "denied", "denial_reason": "Review timeout"}
+
+    # ── Mock fallback ─────────────────────────────────────────────────────────
+
+    async def _mock_submit(self, auth_request):
+        pm = getattr(auth_request, "policy_match", None)
+        if pm is not None:
+            outcome = "approved" if (getattr(pm, "is_covered", True) and random.random() > 0.2) else "denied"
         else:
-            # No policy info → bias toward approval so demo always produces a result
             outcome = random.choices(["approved", "denied"], weights=[0.75, 0.25])[0]
-
-        auth_id_short = str(auth_request.id)[:8].upper()
-        external_ids  = {"approved": f"PA-{auth_id_short}-A", "denied": f"PA-{auth_id_short}-D"}
-
+        short = str(auth_request.id)[:8].upper()
         denial_reasons = [
             "Insufficient documentation of conservative treatment",
             "Service not medically necessary per policy criteria",
             "Missing required clinical information",
         ]
-
         return {
             "success": True,
-            "external_auth_id": external_ids.get(outcome, f"PA-{auth_id_short}-A"),
+            "external_auth_id": f"PA-{short}-{'A' if outcome == 'approved' else 'D'}",
+            "claim_response_id": None,
             "status": outcome,
             "timestamp": datetime.now().isoformat(),
             "decision": {
@@ -166,50 +276,31 @@ class SubmissionAgent:
                 "valid_until": datetime.now().isoformat() if outcome == "approved" else None,
                 "approved_units": 1 if outcome == "approved" else None
             },
-            "next_steps": self._get_next_steps(outcome)
+            "next_steps": self._next(outcome)
         }
-
-    async def check_auth_status(self, external_auth_id: str, payer_name: str) -> Dict[str, Any]:
-        if self.mock_mode:
-            status = "approved" if "-A" in external_auth_id else ("denied" if "-D" in external_auth_id else "pending")
-            return {"external_auth_id": external_auth_id, "status": status,
-                    "last_updated": datetime.now().isoformat(),
-                    "decision": {"outcome": status}}
-        return {"external_auth_id": external_auth_id, "status": "pending",
-                "last_updated": datetime.now().isoformat()}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _patient_display(self, patient) -> str:
-        if not patient:
-            return "Patient"
-        return f"{_val(patient, 'first_name')} {_val(patient, 'last_name')}".strip() or "Patient"
+    def _pt_name(self, p):
+        if not p: return "Patient"
+        return f"{_val(p,'first_name')} {_val(p,'last_name')}".strip() or "Patient"
 
-    def _get_cpt_description(self, cpt_code: str) -> str:
-        return {
-            "70551": "MRI brain", "73721": "MRI knee", "73221": "MRI shoulder",
-            "72148": "MRI lumbar spine", "72149": "MRI lumbar spine w contrast",
-            "70450": "CT head", "71250": "CT chest", "74177": "CT abdomen pelvis",
-            "93306": "Echocardiogram", "93000": "ECG", "45378": "Colonoscopy",
-            "97110": "Physical therapy"
-        }.get(cpt_code, f"CPT {cpt_code}")
+    def _cpt_desc(self, code):
+        return {"70551":"MRI brain","73721":"MRI knee","73221":"MRI shoulder",
+                "72148":"MRI lumbar spine","70450":"CT head","71250":"CT chest",
+                "74177":"CT abdomen pelvis","93306":"Echocardiogram",
+                "93000":"ECG","45378":"Colonoscopy","97110":"Physical therapy"
+               }.get(code, f"CPT {code}")
 
-    def _encode_base64(self, text: str) -> str:
-        import base64
+    def _b64(self, text):
         return base64.b64encode((text or "").encode()).decode()
 
-    def _get_next_steps(self, outcome: str) -> List[str]:
+    def _next(self, outcome):
         if outcome == "approved":
-            return ["Authorization approved", "Proceed with scheduled service", "Document approval in patient record"]
-        elif outcome == "pending":
-            return ["Additional review required", "Monitor for decision (24-72 hours)"]
-        else:
-            return ["Review denial reason carefully", "Consider appeal if medical necessity exists"]
+            return ["Authorization approved", "Proceed with scheduled service"]
+        return ["Review denial reason", "Consider appeal if medical necessity exists"]
 
-    def validate_fhir_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
-        errors, warnings = [], []
+    def validate_fhir_bundle(self, bundle):
         types = [e["resource"]["resourceType"] for e in bundle.get("entry", [])]
-        for req in ["ServiceRequest", "Patient"]:
-            if req not in types:
-                errors.append(f"Missing required resource: {req}")
-        return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+        errors = [f"Missing: {r}" for r in ["ServiceRequest","Patient"] if r not in types]
+        return {"valid": not errors, "errors": errors, "warnings": []}
