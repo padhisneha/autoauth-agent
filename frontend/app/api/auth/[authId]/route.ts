@@ -4,13 +4,12 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:800
 
 export const dynamic = 'force-dynamic';
 
-export async function POST(req: NextRequest) {
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { authId: string } }
+) {
   try {
-    const body = await req.json();
-    const res = await fetch(`${BACKEND_URL}/api/demo/scenario`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+    const res = await fetch(`${BACKEND_URL}/api/auth/${params.authId}`, {
       cache: 'no-store',
     });
     const data = await res.json();

@@ -1,5 +1,6 @@
 'use client';
 import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FileCheck, Clock, CheckCircle2, XCircle, Filter, X, ChevronRight, FileText, Send } from 'lucide-react';
 import { cn, getStatusColor } from '@/lib/utils';
@@ -114,6 +115,7 @@ export default function AuthorizationsPage() {
       </div>
 
       {/* Detail modal */}
+      {typeof window !== 'undefined' && createPortal(
       <AnimatePresence>
         {selected && (
           <motion.div initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
@@ -217,6 +219,7 @@ export default function AuthorizationsPage() {
           </motion.div>
         )}
       </AnimatePresence>
+      , document.body)}
     </div>
   );
 }

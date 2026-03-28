@@ -125,6 +125,9 @@ class AuthorizationWorkflow:
             if state["current_state"] == WorkflowState.APPROVED:
                 pass  # done
 
+            elif state["current_state"] == WorkflowState.MONITORING:
+                pass  # still awaiting payer — poll timed out, payer portal still open
+
             elif state["current_state"] == WorkflowState.DENIED:
                 # If preemptive appeal already generated → skip generation, go straight to submission
                 if state.get("appeal_letter"):
@@ -367,19 +370,28 @@ class AuthorizationWorkflow:
         self._start(state, "MonitoringAgent")
         res     = state.get("submission_result", {})
         dec     = res.get("decision", {})
-        outcome = str(dec.get("outcome") or res.get("status") or "approved").lower()
+        outcome = str(dec.get("outcome") or res.get("status") or "pending").lower()
 
         if outcome == "approved":
             state["current_state"] = WorkflowState.APPROVED
-        else:
+            self._done(state, "MonitoringAgent", {"decision": "approved"})
+        elif outcome == "denied":
             state["current_state"] = WorkflowState.DENIED
             existing_denial = state.get("denial_analysis", {})
             state["denial_analysis"] = {
                 **existing_denial,
                 "denial_reason": dec.get("reason") or "Service not medically necessary"
             }
+            self._done(state, "MonitoringAgent", {"decision": "denied"})
+        else:
+            # pending / timeout — payer hasn't decided yet
+            # Keep state as MONITORING so the UI shows "Awaiting payer review"
+            state["current_state"] = WorkflowState.MONITORING
+            self._done(state, "MonitoringAgent", {
+                "decision": "awaiting_review",
+                "note": "Payer review in progress — check payer portal"
+            })
 
-        self._done(state, "MonitoringAgent", {"decision": outcome})
         state = self._log(state, "payer_decision", {"outcome": outcome})
         if cb: await cb(state)
         return state

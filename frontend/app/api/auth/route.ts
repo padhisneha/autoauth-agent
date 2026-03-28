@@ -2,12 +2,16 @@ import { NextResponse } from 'next/server';
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/auth`);
+    const res = await fetch(`${BACKEND_URL}/api/auth`, {
+      cache: 'no-store',
+    });
     const data = await res.json();
     return NextResponse.json(data, { status: res.status });
-  } catch (err) {
+  } catch {
     return NextResponse.json({ authorizations: [] }, { status: 502 });
   }
 }

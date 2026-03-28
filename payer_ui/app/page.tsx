@@ -1,4 +1,5 @@
 'use client';
+import { createPortal } from 'react-dom';
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Clock, CheckCircle2, XCircle, FileText, RefreshCw, ChevronRight, AlertCircle, Activity } from 'lucide-react';
@@ -85,7 +86,7 @@ export default function PayerDashboard() {
       </div>
 
       {/* Queue */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm">
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold text-slate-900">Authorization Queue</h2>
@@ -163,9 +164,11 @@ export default function PayerDashboard() {
         )}
       </div>
 
-      <AnimatePresence>
-        {selected && <ReviewModal item={selected} onClose={()=>setSelected(null)} onDecision={()=>{setSelected(null);fetchData();}}/>}
-      </AnimatePresence>
+      {typeof window !== 'undefined' && createPortal(
+        <AnimatePresence>
+          {selected && <ReviewModal item={selected} onClose={()=>setSelected(null)} onDecision={()=>{setSelected(null);fetchData();}}/>}
+        </AnimatePresence>
+      , document.body)}
     </div>
   );
 }

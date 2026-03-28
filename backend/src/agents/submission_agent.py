@@ -7,8 +7,8 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 FHIR_SERVER_URL   = "http://localhost:8001"
-POLL_INTERVAL     = 2
-POLL_MAX_ATTEMPTS = 60
+POLL_INTERVAL     = 3
+POLL_MAX_ATTEMPTS = 300  # 15 min max wait
 
 
 def _val(entity, attr, default=""):
@@ -144,7 +144,7 @@ class SubmissionAgent:
 
         claim_id = cr.get("claim_response_id") or cr.get("id")
         decision = await self._poll(claim_id)
-        outcome  = decision.get("auth_status", "denied")
+        outcome  = decision.get("auth_status", "pending")
         return {
             "success": True,
             "external_auth_id": f"PA-{str(auth_request.id)[:8].upper()}-{claim_id}",
@@ -226,7 +226,7 @@ class SubmissionAgent:
             except Exception as e:
                 print(f"[SubmissionAgent] Poll {attempt+1}: {e}")
             await asyncio.sleep(POLL_INTERVAL)
-        return {"auth_status": "denied", "denial_reason": "Review timeout — please check payer portal"}
+        return {"auth_status": "pending", "denial_reason": None, "timeout": True}
 
     async def _mock_submit(self, auth_request) -> Dict[str, Any]:
         pm = getattr(auth_request, "policy_match", None)
