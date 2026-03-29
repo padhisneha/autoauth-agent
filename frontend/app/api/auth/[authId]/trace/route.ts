@@ -9,7 +9,7 @@ export async function GET(
   { params }: { params: { authId: string } }
 ) {
   try {
-    // Must call /api/auth/{id}/trace — not /api/auth/{id}
+    // Must call /trace — not /api/auth/{id} which returns the auth object, not workflow state
     const res = await fetch(`${BACKEND_URL}/api/auth/${params.authId}/trace`, {
       cache: 'no-store',
     });

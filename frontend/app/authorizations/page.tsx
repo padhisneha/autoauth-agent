@@ -1,6 +1,5 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FileCheck, Clock, CheckCircle2, XCircle, Filter, X, ChevronRight, FileText, Send } from 'lucide-react';
 import { cn, getStatusColor } from '@/lib/utils';
@@ -21,8 +20,8 @@ function clean(s: string) { return (s||'').split('.').pop()?.toLowerCase() || 'p
 
 function statusIcon(s: string) {
   const cs = clean(s);
-  if (cs==='approved') return <CheckCircle2 className="w-4 h-4 text-green-500"/>;
-  if (cs==='denied')   return <XCircle className="w-4 h-4 text-red-500"/>;
+  if (cs==='approved' || cs==='appeal_approved') return <CheckCircle2 className="w-4 h-4 text-green-500"/>;
+  if (cs==='denied' || cs==='appeal_denied') return <XCircle className="w-4 h-4 text-red-500"/>;
   if (cs.includes('appeal')) return <FileText className="w-4 h-4 text-amber-500"/>;
   return <Clock className="w-4 h-4 text-yellow-500"/>;
 }
@@ -115,7 +114,6 @@ export default function AuthorizationsPage() {
       </div>
 
       {/* Detail modal */}
-      {typeof window !== 'undefined' && createPortal(
       <AnimatePresence>
         {selected && (
           <motion.div initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
@@ -219,7 +217,6 @@ export default function AuthorizationsPage() {
           </motion.div>
         )}
       </AnimatePresence>
-      , document.body)}
     </div>
   );
 }

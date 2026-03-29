@@ -36,6 +36,10 @@ const statusConfig: Record<string, { icon: React.ElementType; color: string; bg:
   evidence_extraction: { icon: Brain, color: 'text-purple-600', bg: 'bg-purple-100' },
   policy_lookup: { icon: Shield, color: 'text-cyan-600', bg: 'bg-cyan-100' },
   appeal_generation: { icon: FileText, color: 'text-amber-600', bg: 'bg-amber-100' },
+  appeal_approved: { icon: CheckCircle2, color: 'text-green-600', bg: 'bg-green-100' },
+  appeal_denied: { icon: XCircle, color: 'text-red-600', bg: 'bg-red-100' },
+  appeal_submission: { icon: Send, color: 'text-orange-600', bg: 'bg-orange-100' },
+  appeal_monitoring: { icon: Activity, color: 'text-rose-600', bg: 'bg-rose-100' },
 };
 
 export function LiveActivityFeed({ activities }: LiveActivityFeedProps) {

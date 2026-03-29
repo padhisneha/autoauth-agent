@@ -23,8 +23,8 @@ function ptName(auth: Authorization) {
 
 function statusIcon(s: string) {
   const cs = clean(s);
-  if (cs==='approved') return <CheckCircle2 className="w-4 h-4 text-green-500"/>;
-  if (cs==='denied')   return <XCircle className="w-4 h-4 text-red-500"/>;
+  if (cs==='approved' || cs==='appeal_approved') return <CheckCircle2 className="w-4 h-4 text-green-500"/>;
+  if (cs==='denied' || cs==='appeal_denied') return <XCircle className="w-4 h-4 text-red-500"/>;
   if (cs.includes('appeal')) return <FileText className="w-4 h-4 text-amber-500"/>;
   return <Clock className="w-4 h-4 text-yellow-500"/>;
 }

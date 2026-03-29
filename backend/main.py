@@ -421,6 +421,7 @@ async def get_trace(auth_id: str):
         "submission_result": ws.get("submission_result"),
         "appeal_letter": ws.get("appeal_letter"),
         "appeal_submission_result": ws.get("appeal_submission_result"),
+        "appeal_decision": ws.get("appeal_decision"),
         "denial_analysis": ws.get("denial_analysis"),
     }
 
@@ -461,7 +462,7 @@ async def load_scenario(request: ScenarioRequest):
 @app.get("/api/dashboard/stats")
 async def get_stats():
     total    = len(auth_requests)
-    approved = sum(1 for a in auth_requests.values() if _clean(a.get("status","")) == "approved")
+    approved = sum(1 for a in auth_requests.values() if _clean(a.get("status","")) in ["approved","appeal_approved"])
     denied   = sum(1 for a in auth_requests.values() if _clean(a.get("status","")) in ["denied","appeal_denied"])
     pending  = max(total - approved - denied, 0)
     rate     = (approved / (approved + denied) * 100) if (approved + denied) > 0 else 0

@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 
 FHIR_SERVER_URL   = "http://localhost:8001"
 POLL_INTERVAL     = 3
-POLL_MAX_ATTEMPTS = 300  # 15 min max wait
+POLL_MAX_ATTEMPTS = 300  # 15 min
 
 
 def _val(entity, attr, default=""):

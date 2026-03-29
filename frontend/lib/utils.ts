@@ -42,11 +42,18 @@ export function formatPercentage(num: number): string {
 export function getStatusColor(status: string): string {
   const colors: Record<string, string> = {
     approved: 'bg-green-100 text-green-800',
+    appeal_approved: 'bg-green-100 text-green-800',
     denied: 'bg-red-100 text-red-800',
+    appeal_denied: 'bg-red-100 text-red-800',
     pending: 'bg-yellow-100 text-yellow-800',
+    monitoring: 'bg-yellow-100 text-yellow-800',
+    appeal_submission: 'bg-orange-100 text-orange-800',
+    appeal_monitoring: 'bg-orange-100 text-orange-800',
+    appeal_generation: 'bg-amber-100 text-amber-800',
     submitted: 'bg-blue-100 text-blue-800',
     processing: 'bg-purple-100 text-purple-800',
     completed: 'bg-slate-100 text-slate-800',
+    requires_human_review: 'bg-red-100 text-red-800',
   };
   return colors[status.toLowerCase()] || 'bg-slate-100 text-slate-800';
 }

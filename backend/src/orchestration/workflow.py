@@ -1,18 +1,31 @@
 """
-Orchestration Layer — AutoAuth Agent multi-agent workflow with Prediction Engine.
+Orchestration Layer — AutoAuth Agent using LangGraph.
 
-Flow:
-  Triage → Evidence → Policy → Prediction → Decision Engine
-     → [if high prob] Submit → Payer → approved ✓
-     → [if low prob]  Generate appeal EARLY → Submit + attach justification → Payer
-        → if denied → instantly resubmit appeal (already ready)
-        → if approved → ✓
+Graph structure:
+  triage → evidence → policy → validation → prediction → decision_engine
+    → submission → monitoring
+      → approved                                          (END)
+      → monitoring_pending  (awaiting payer review)       (END)
+      → denied → appeal_generate → appeal_submit → appeal_monitoring
+          → appeal_approved                               (END)
+          → appeal_denied                                 (END)
+  Any unhandled exception → requires_human_review         (END)
+
+The preemptive appeal path (low probability) is handled inside decision_engine:
+the appeal letter is generated there and attached to the FHIR bundle at submission.
 """
 
-from datetime import datetime
-from typing import Dict, Any, List
-from enum import Enum
+from __future__ import annotations
 
+import traceback
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, TypedDict
+
+from langgraph.graph import StateGraph, END
+
+
+# ── Enums (kept identical — nothing else in the codebase needs to change) ────
 
 class WorkflowState(str, Enum):
     PENDING               = "pending"
@@ -22,7 +35,7 @@ class WorkflowState(str, Enum):
     VALIDATION            = "validation"
     PREDICTION            = "prediction"
     DECISION_ENGINE       = "decision_engine"
-    PREEMPTIVE_APPEAL     = "preemptive_appeal"   # NEW — appeal generated before submission
+    PREEMPTIVE_APPEAL     = "preemptive_appeal"
     SUBMISSION            = "submission"
     MONITORING            = "monitoring"
     APPROVED              = "approved"
@@ -30,7 +43,7 @@ class WorkflowState(str, Enum):
     APPEAL_ANALYSIS       = "appeal_analysis"
     APPEAL_GENERATION     = "appeal_generation"
     APPEAL_SUBMISSION     = "appeal_submission"
-    APPEAL_MONITORING     = "appeal_monitoring"   # NEW — polls for appeal decision
+    APPEAL_MONITORING     = "appeal_monitoring"
     APPEAL_APPROVED       = "appeal_approved"
     APPEAL_DENIED         = "appeal_denied"
     COMPLETED             = "completed"
@@ -40,6 +53,25 @@ class WorkflowState(str, Enum):
 class AgentStatus(str, Enum):
     IDLE = "idle"; RUNNING = "running"; COMPLETED = "completed"
     FAILED = "failed"; WAITING = "waiting"
+
+
+# ── LangGraph typed state ─────────────────────────────────────────────────────
+
+class GraphState(TypedDict, total=False):
+    auth_id: str; patient_id: str; service_type: str; cpt_code: str; icd10_code: str
+    # Runtime refs injected before the graph runs (not serialised to client)
+    _auth_request: Any; _clinical_notes: List[Any]; _callback: Optional[Callable]
+    _clinical_reader: Any; _policy: Any; _submission: Any; _appeal: Any
+    # Workflow data
+    current_state: str
+    clinical_evidence: Optional[Dict]; policy_requirements: Optional[Dict]
+    policy_match: Optional[Dict]; prediction: Optional[Dict]
+    preemptive_appeal: bool; fhir_bundle: Optional[Dict]
+    submission_result: Optional[Dict]; denial_analysis: Optional[Dict]
+    appeal_letter: Optional[str]; appeal_submission_result: Optional[Dict]
+    appeal_decision: Optional[Dict]
+    agents: Dict; processing_log: List; error: Optional[str]
+    created_at: Any; updated_at: Any
 
 
 # ── Proxy helpers ─────────────────────────────────────────────────────────────
@@ -81,480 +113,416 @@ class _PolicyProxy:
         try: return self._d[n]
         except KeyError: return None
     @property
-    def is_covered(self): return bool(self._d.get("is_covered", False))
+    def is_covered(self):             return bool(self._d.get("is_covered", False))
     @property
-    def match_score(self): return float(self._d.get("match_score", 0.0))
-    @property
-    def policy_name(self): return self._d.get("policy_name", "")
+    def match_score(self):            return float(self._d.get("match_score", 0.0))
     @property
     def satisfied_requirements(self): return self._d.get("satisfied_requirements", [])
     @property
-    def missing_requirements(self): return self._d.get("missing_requirements", [])
+    def missing_requirements(self):   return self._d.get("missing_requirements", [])
 
 
-# ── Workflow ──────────────────────────────────────────────────────────────────
+# ── State mutation helpers ────────────────────────────────────────────────────
+
+def _agent_start(s: GraphState, name: str) -> GraphState:
+    agents = dict(s.get("agents", {}))
+    agents[name] = {"name": name, "status": AgentStatus.RUNNING,
+                    "start_time": datetime.now(), "end_time": None,
+                    "input_data": {}, "output_data": {},
+                    "reasoning_steps": [], "error": None, "tokens_used": 0}
+    return {**s, "agents": agents, "updated_at": datetime.now()}
+
+def _agent_done(s: GraphState, name: str, output: dict) -> GraphState:
+    agents = dict(s.get("agents", {}))
+    if name in agents:
+        agents[name] = {**agents[name], "status": AgentStatus.COMPLETED,
+                        "end_time": datetime.now(), "output_data": output}
+    return {**s, "agents": agents, "updated_at": datetime.now()}
+
+def _log_event(s: GraphState, event: str, data: dict) -> GraphState:
+    log = list(s.get("processing_log", []))
+    log.append({"timestamp": datetime.now().isoformat(),
+                "event_type": event,
+                "state": str(s.get("current_state", "")), "data": data})
+    return {**s, "processing_log": log}
+
+async def _fire_callback(s: GraphState) -> None:
+    cb = s.get("_callback")
+    if cb: await cb(s)
+
+
+# ── Node implementations ──────────────────────────────────────────────────────
+
+async def node_triage(s: GraphState) -> GraphState:
+    s = _agent_start(s, "TriageAgent")
+    urgent = "urgent" in str(s.get("service_type", "")).lower()
+    s = {**s, "current_state": WorkflowState.TRIAGE}
+    s = _agent_done(s, "TriageAgent", {"is_urgent": urgent, "priority": "urgent" if urgent else "standard"})
+    s = _log_event(s, "triage_completed", {"is_urgent": urgent})
+    await _fire_callback(s)
+    return s
+
+
+async def node_evidence(s: GraphState) -> GraphState:
+    s = _agent_start(s, "ClinicalReaderAgent")
+    cr = s["_clinical_reader"]
+    ev = await cr.extract_clinical_evidence(s["_clinical_notes"], s["patient_id"], s["service_type"], s["cpt_code"])
+    na = await cr.analyze_medical_necessity(ev, s["service_type"], s["cpt_code"])
+    ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else vars(ev)
+    s = {**s, "current_state": WorkflowState.EVIDENCE_EXTRACTION,
+              "clinical_evidence": {"evidence": ev_dict, "necessity_analysis": na}}
+    s = _agent_done(s, "ClinicalReaderAgent", {
+        "conditions_found": len(ev.conditions),
+        "confidence": round(ev.extraction_confidence, 2),
+        "summary": (ev.clinical_summary or "")[:150]})
+    s = _log_event(s, "evidence_done", {"conditions": len(ev.conditions)})
+    await _fire_callback(s)
+    return s
+
+
+async def node_policy(s: GraphState) -> GraphState:
+    s = _agent_start(s, "PolicyAgent")
+    auth_req = s["_auth_request"]
+    payer = getattr(getattr(auth_req, "patient", None), "payer_name", "Blue Cross Blue Shield")
+    req = await s["_policy"].retrieve_policy_requirements(payer, s["service_type"], s["cpt_code"])
+    ev  = _EvidenceProxy(s.get("clinical_evidence", {}).get("evidence", {}))
+    pm  = await s["_policy"].match_policy(ev, req, payer)
+    s = {**s, "current_state": WorkflowState.POLICY_LOOKUP,
+              "policy_requirements": req.model_dump() if hasattr(req, "model_dump") else {},
+              "policy_match":        pm.model_dump()  if hasattr(pm,  "model_dump") else {}}
+    s = _agent_done(s, "PolicyAgent", {
+        "match_score": round(pm.match_score, 2), "is_covered": pm.is_covered,
+        "missing": len(pm.missing_requirements)})
+    s = _log_event(s, "policy_done", {"match_score": pm.match_score})
+    await _fire_callback(s)
+    return s
+
+
+async def node_validation(s: GraphState) -> GraphState:
+    s = _agent_start(s, "ValidationAgent")
+    s = {**s, "current_state": WorkflowState.VALIDATION}
+    s = _agent_done(s, "ValidationAgent", {"can_proceed": True})
+    s = _log_event(s, "validation_done", {})
+    await _fire_callback(s)
+    return s
+
+
+async def node_prediction(s: GraphState) -> GraphState:
+    """🔮 Prediction Engine."""
+    s = _agent_start(s, "PredictionAgent")
+    s = {**s, "current_state": WorkflowState.PREDICTION}
+    auth_req = s["_auth_request"]
+    pm_data  = s.get("policy_match", {})
+    na       = s.get("clinical_evidence", {}).get("necessity_analysis", {})
+
+    match_score     = float(pm_data.get("match_score", 0.5))
+    is_covered      = bool(pm_data.get("is_covered", False))
+    missing_count   = len(pm_data.get("missing_requirements", []))
+    satisfied_count = len(pm_data.get("satisfied_requirements", []))
+    necessity_score = float(na.get("necessity_score", 0.5))
+    payer = getattr(getattr(auth_req, "patient", None), "payer_name", "")
+    payer_factor = {"Blue Cross Blue Shield": 0.0, "Aetna": -0.05,
+                    "UnitedHealthcare": -0.05, "Cigna": -0.08, "Medicare": 0.02}.get(payer, -0.03)
+
+    prob = max(0.05, min(0.95,
+        (match_score * 0.4) + (necessity_score * 0.35) + (0.1 if is_covered else 0.0)
+        + min(satisfied_count * 0.04, 0.15) - min(missing_count * 0.06, 0.20) + payer_factor))
+
+    if prob >= 0.75:   risk, strategy = "low",    "direct_submit"
+    elif prob >= 0.55: risk, strategy = "medium",  "submit_with_justification"
+    else:              risk, strategy = "high",    "preemptive_appeal"
+
+    reasoning = {
+        "direct_submit":            f"Strong policy match ({match_score:.0%}) and necessity score ({necessity_score:.0%}). Confident approval expected.",
+        "submit_with_justification": "Moderate approval probability. Submitting with enhanced clinical justification.",
+        "preemptive_appeal":        f"Low approval probability ({prob:.0%}) — generating appeal proactively before submission.",
+    }[strategy]
+
+    prediction = {
+        "approval_probability": round(prob, 3), "risk_level": risk,
+        "strategy": strategy, "reasoning": reasoning,
+        "policy_match_score": round(match_score, 2), "necessity_score": round(necessity_score, 2),
+        "missing_criteria": missing_count, "satisfied_criteria": satisfied_count, "payer": payer,
+    }
+    s = {**s, "prediction": prediction}
+    s = _agent_done(s, "PredictionAgent", {"approval_probability": f"{prob:.0%}", "risk_level": risk, "strategy": strategy})
+    s = _log_event(s, "prediction_complete", prediction)
+    await _fire_callback(s)
+    return s
+
+
+async def node_decision_engine(s: GraphState) -> GraphState:
+    """🧠 Decision Engine — may generate preemptive appeal inside this node."""
+    s = _agent_start(s, "DecisionEngine")
+    s = {**s, "current_state": WorkflowState.DECISION_ENGINE}
+
+    prediction = s.get("prediction", {})
+    strategy   = prediction.get("strategy", "direct_submit")
+    prob       = prediction.get("approval_probability", 0.5)
+    auth_req   = s["_auth_request"]
+
+    if strategy == "preemptive_appeal":
+        s = {**s, "current_state": WorkflowState.PREEMPTIVE_APPEAL}
+        await _fire_callback(s)
+
+        ev = _EvidenceProxy(s.get("clinical_evidence", {}).get("evidence", {}))
+        pm = _PolicyProxy(s.get("policy_match", {}))
+        preemptive_denial = {
+            "denial_reason": f"Anticipated: {', '.join(pm.missing_requirements[:2]) or 'incomplete documentation'}",
+            "primary_appeal_argument": "Proactive documentation package demonstrates full medical necessity.",
+            "supporting_evidence": [], "urgency_indicators": [], "peer_review_recommended": True,
+            "success_probability": min(prob + 0.2, 0.85),
+        }
+        s = _agent_start(s, "AppealAgent")
+        letter = await s["_appeal"].generate_appeal_letter(auth_req, preemptive_denial, ev, pm)
+        s = {**s, "appeal_letter": letter, "denial_analysis": preemptive_denial, "preemptive_appeal": True}
+        s = _agent_done(s, "AppealAgent", {
+            "word_count": len(letter.split()), "type": "preemptive",
+            "success_probability": f"{preemptive_denial['success_probability']:.0%}"})
+        s = _log_event(s, "preemptive_appeal_generated", {"word_count": len(letter.split())})
+
+    s = _agent_done(s, "DecisionEngine", {
+        "strategy": strategy, "probability": f"{prob:.0%}",
+        "action": "Appeal pre-generated" if strategy == "preemptive_appeal" else "Proceeding with submission"})
+    s = {**s, "current_state": WorkflowState.DECISION_ENGINE}
+    s = _log_event(s, "decision_engine_complete", {"strategy": strategy})
+    await _fire_callback(s)
+    return s
+
+
+async def node_submission(s: GraphState) -> GraphState:
+    s = _agent_start(s, "SubmissionAgent")
+    auth_req   = s["_auth_request"]
+    ev         = _EvidenceProxy(s.get("clinical_evidence", {}).get("evidence", {}))
+    pm         = _PolicyProxy(s.get("policy_match", {}))
+    preemptive = s.get("appeal_letter") if s.get("preemptive_appeal") else None
+
+    class _Auth:
+        def __init__(self_, ss, a):
+            self_.id = ss["auth_id"]; self_.patient_id = ss["patient_id"]
+            self_.cpt_code = ss["cpt_code"]; self_.patient = a.patient; self_.policy_match = pm
+
+    sa     = _Auth(s, auth_req)
+    bundle = await s["_submission"].build_fhir_bundle(sa, ev, pm, appeal_letter=preemptive)
+    result = await s["_submission"].submit_prior_authorization(sa, bundle)
+    s = {**s, "current_state": WorkflowState.SUBMISSION, "fhir_bundle": bundle, "submission_result": result}
+    s = _agent_done(s, "SubmissionAgent", {
+        "claim_id": result.get("claim_response_id"), "status": result.get("status"),
+        "strategy": "preemptive_attached" if preemptive else "standard"})
+    s = _log_event(s, "submission_done", {"status": result.get("status")})
+    await _fire_callback(s)
+    return s
+
+
+async def node_monitoring(s: GraphState) -> GraphState:
+    s = _agent_start(s, "MonitoringAgent")
+    res     = s.get("submission_result", {})
+    dec     = res.get("decision", {})
+    outcome = str(dec.get("outcome") or res.get("status") or "pending").lower()
+
+    if outcome == "approved":
+        s = {**s, "current_state": WorkflowState.APPROVED}
+        s = _agent_done(s, "MonitoringAgent", {"decision": "approved"})
+    elif outcome == "denied":
+        existing = s.get("denial_analysis") or {}
+        s = {**s, "current_state": WorkflowState.DENIED,
+                  "denial_analysis": {**existing, "denial_reason": dec.get("reason") or "Service not medically necessary"}}
+        s = _agent_done(s, "MonitoringAgent", {"decision": "denied"})
+    else:
+        # pending / timeout — payer hasn't decided yet
+        s = {**s, "current_state": WorkflowState.MONITORING}
+        s = _agent_done(s, "MonitoringAgent", {"decision": "awaiting_review", "note": "Check payer portal"})
+
+    s = _log_event(s, "payer_decision", {"outcome": outcome})
+    await _fire_callback(s)
+    return s
+
+
+async def node_appeal_generate(s: GraphState) -> GraphState:
+    auth_req = s["_auth_request"]
+    denial   = (s.get("denial_analysis") or {}).get("denial_reason", "Not medically necessary")
+    ev = _EvidenceProxy(s.get("clinical_evidence", {}).get("evidence", {}))
+    pm = _PolicyProxy(s.get("policy_match", {}))
+
+    analysis = await s["_appeal"].analyze_denial(auth_req, denial, ev, pm)
+    s = {**s, "denial_analysis": analysis, "current_state": WorkflowState.APPEAL_ANALYSIS}
+    await _fire_callback(s)
+
+    s = _agent_start(s, "AppealAgent")
+    letter = await s["_appeal"].generate_appeal_letter(auth_req, analysis, ev, pm)
+    s = {**s, "appeal_letter": letter, "current_state": WorkflowState.APPEAL_GENERATION}
+    s = _agent_done(s, "AppealAgent", {
+        "word_count": len(letter.split()),
+        "success_probability": f"{analysis.get('success_probability', 0.5):.0%}"})
+    s = _log_event(s, "appeal_generated", {"word_count": len(letter.split())})
+    await _fire_callback(s)
+    return s
+
+
+async def node_appeal_submit(s: GraphState) -> GraphState:
+    s = _agent_start(s, "AppealSubmissionAgent")
+    s = {**s, "current_state": WorkflowState.APPEAL_SUBMISSION}
+    await _fire_callback(s)
+
+    auth_req = s["_auth_request"]
+    pm = _PolicyProxy(s.get("policy_match", {}))
+
+    class _AppealAuth:
+        def __init__(self_, ss, a):
+            self_.id = ss["auth_id"] + "-APPEAL"; self_.patient_id = ss["patient_id"]
+            self_.cpt_code = ss["cpt_code"]; self_.patient = a.patient; self_.policy_match = pm
+
+    aa     = _AppealAuth(s, auth_req)
+    result = await s["_submission"].submit_appeal(aa, s.get("fhir_bundle", {}), s.get("appeal_letter", ""))
+    s = {**s, "appeal_submission_result": result}
+    s = _agent_done(s, "AppealSubmissionAgent", {
+        "claim_id": result.get("claim_response_id"),
+        "status":   result.get("status", "submitted"),
+        "message":  result.get("message", "Appeal sent to payer")})
+    s = _log_event(s, "appeal_submitted", {"claim_id": result.get("claim_response_id")})
+    await _fire_callback(s)
+    return s
+
+
+async def node_appeal_monitoring(s: GraphState) -> GraphState:
+    s = _agent_start(s, "AppealMonitoringAgent")
+    s = {**s, "current_state": WorkflowState.APPEAL_MONITORING}
+    await _fire_callback(s)
+
+    claim_id = (s.get("appeal_submission_result") or {}).get("claim_response_id")
+    if not claim_id:
+        s = _agent_done(s, "AppealMonitoringAgent", {"decision": "awaiting_payer_review"})
+        s = _log_event(s, "appeal_monitoring_skipped", {"reason": "no_claim_id"})
+        await _fire_callback(s)
+        return s
+
+    data    = await s["_submission"]._poll(claim_id)
+    outcome = data.get("auth_status", "pending")
+
+    if outcome == "approved":   s = {**s, "current_state": WorkflowState.APPEAL_APPROVED}
+    elif outcome == "denied":   s = {**s, "current_state": WorkflowState.APPEAL_DENIED}
+    else:                       s = {**s, "current_state": WorkflowState.APPEAL_SUBMISSION}
+
+    s = {**s, "appeal_decision": {
+        "outcome": outcome, "decided_at": data.get("decided_at"),
+        "reviewer": data.get("reviewer"), "denial_reason": data.get("denial_reason")}}
+    s = _agent_done(s, "AppealMonitoringAgent", {"decision": outcome, "decided_at": data.get("decided_at", "")})
+    s = _log_event(s, "appeal_decision_received", {"outcome": outcome})
+    await _fire_callback(s)
+    return s
+
+
+# ── Conditional edge routing ──────────────────────────────────────────────────
+
+def route_monitoring(s: GraphState) -> str:
+    cs = str(s.get("current_state", "")).split(".")[-1].lower()
+    if cs == "approved": return "approved"
+    if cs == "denied":   return "appeal_generate"
+    return "pending"  # timeout / still waiting
+
+
+def route_appeal_monitoring(s: GraphState) -> str:
+    cs = str(s.get("current_state", "")).split(".")[-1].lower()
+    return "appeal_approved" if cs == "appeal_approved" else "appeal_denied"
+
+
+# ── Graph assembly ────────────────────────────────────────────────────────────
+
+def _build_graph():
+    g = StateGraph(GraphState)
+
+    for name, fn in [
+        ("triage",            node_triage),
+        ("evidence",          node_evidence),
+        ("policy",            node_policy),
+        ("validation",        node_validation),
+        ("prediction",        node_prediction),
+        ("decision_engine",   node_decision_engine),
+        ("submission",        node_submission),
+        ("monitoring",        node_monitoring),
+        ("appeal_generate",   node_appeal_generate),
+        ("appeal_submit",     node_appeal_submit),
+        ("appeal_monitoring", node_appeal_monitoring),
+    ]:
+        g.add_node(name, fn)
+
+    g.set_entry_point("triage")
+
+    # Linear spine
+    for a, b in [("triage","evidence"), ("evidence","policy"), ("policy","validation"),
+                 ("validation","prediction"), ("prediction","decision_engine"),
+                 ("decision_engine","submission"), ("submission","monitoring")]:
+        g.add_edge(a, b)
+
+    # After monitoring: branch on outcome
+    g.add_conditional_edges("monitoring", route_monitoring, {
+        "approved":      END,
+        "pending":       END,   # awaiting payer — workflow parks here
+        "appeal_generate":"appeal_generate",
+    })
+
+    # Appeal spine
+    g.add_edge("appeal_generate",   "appeal_submit")
+    g.add_edge("appeal_submit",     "appeal_monitoring")
+
+    # After appeal monitoring: always END
+    g.add_conditional_edges("appeal_monitoring", route_appeal_monitoring, {
+        "appeal_approved": END,
+        "appeal_denied":   END,
+    })
+
+    return g.compile()
+
+
+# ── Public API — identical to before so main.py needs no changes ─────────────
 
 class AuthorizationWorkflow:
-    LOW_PROB_THRESHOLD  = 0.55   # below this → preemptive appeal path
-    HIGH_PROB_THRESHOLD = 0.75   # above this → confident direct submit
-
     def __init__(self, clinical_reader, policy, submission, appeal):
         self.clinical_reader = clinical_reader
         self.policy          = policy
         self.submission      = submission
         self.appeal          = appeal
+        self._graph          = _build_graph()
 
-    async def execute_workflow(self, auth_request, clinical_notes, callback=None):
-        state = self._init(auth_request)
-        try:
-            # ── Core pipeline ──────────────────────────────────────────────
-            state = await self._triage(state, callback)
-            state = await self._evidence(state, clinical_notes, callback)
-            state = await self._policy_lookup(state, auth_request, callback)
-            state = await self._validation(state, callback)
-
-            # ── Prediction Engine ──────────────────────────────────────────
-            state = await self._prediction(state, auth_request, callback)
-            state = await self._decision_engine(state, auth_request, callback)
-
-            # ── Submission (with or without preemptive appeal) ─────────────
-            state = await self._submission(state, auth_request, callback)
-            state = await self._monitoring(state, callback)
-
-            # ── Handle payer decision ──────────────────────────────────────
-            if state["current_state"] == WorkflowState.APPROVED:
-                pass  # done
-
-            elif state["current_state"] == WorkflowState.MONITORING:
-                pass  # still awaiting payer — poll timed out, payer portal still open
-
-            elif state["current_state"] == WorkflowState.DENIED:
-                # If preemptive appeal already generated → skip generation, go straight to submission
-                if state.get("appeal_letter"):
-                    # Appeal was pre-generated; just resubmit immediately
-                    state["current_state"] = WorkflowState.APPEAL_ANALYSIS
-                    if callback: await callback(state)
-                    state = await self._appeal_submit(state, auth_request, callback)
-                else:
-                    # Standard path: analyse denial, generate letter, then submit
-                    state = await self._appeal_generate(state, auth_request, callback)
-                    state = await self._appeal_submit(state, auth_request, callback)
-
-                # Poll FHIR server for appeal decision
-                state = await self._appeal_monitoring(state, callback)
-
-        except Exception as e:
-            import traceback
-            print(f"[WORKFLOW ERROR]\n{traceback.format_exc()}")
-            state["error"] = str(e)
-            state["current_state"] = WorkflowState.REQUIRES_HUMAN_REVIEW
-            state = self._log(state, "error", {"error": str(e)})
-            if callback: await callback(state)
-
-        return self._compile(state)
-
-    # ── Stages ───────────────────────────────────────────────────────────────
-
-    async def _triage(self, state, cb):
-        self._start(state, "TriageAgent")
-        urgent = "urgent" in str(state.get("service_type", "")).lower()
-        state["current_state"] = WorkflowState.TRIAGE
-        self._done(state, "TriageAgent", {"is_urgent": urgent, "priority": "urgent" if urgent else "standard"})
-        state = self._log(state, "triage_completed", {"is_urgent": urgent})
-        if cb: await cb(state)
-        return state
-
-    async def _evidence(self, state, notes, cb):
-        self._start(state, "ClinicalReaderAgent")
-        ev = await self.clinical_reader.extract_clinical_evidence(
-            notes, state["patient_id"], state["service_type"], state["cpt_code"])
-        na = await self.clinical_reader.analyze_medical_necessity(
-            ev, state["service_type"], state["cpt_code"])
-        ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else vars(ev)
-        state["clinical_evidence"] = {"evidence": ev_dict, "necessity_analysis": na}
-        state["current_state"] = WorkflowState.EVIDENCE_EXTRACTION
-        self._done(state, "ClinicalReaderAgent", {
-            "conditions_found": len(ev.conditions),
-            "confidence": round(ev.extraction_confidence, 2),
-            "summary": (ev.clinical_summary or "")[:150]
-        })
-        state = self._log(state, "evidence_done", {"conditions": len(ev.conditions)})
-        if cb: await cb(state)
-        return state
-
-    async def _policy_lookup(self, state, auth_req, cb):
-        self._start(state, "PolicyAgent")
-        payer = getattr(getattr(auth_req, "patient", None), "payer_name", "Blue Cross Blue Shield")
-        req = await self.policy.retrieve_policy_requirements(payer, state["service_type"], state["cpt_code"])
-        ev  = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
-        pm  = await self.policy.match_policy(ev, req, payer)
-        state["policy_requirements"] = req.model_dump() if hasattr(req, "model_dump") else {}
-        state["policy_match"]        = pm.model_dump() if hasattr(pm, "model_dump") else {}
-        state["current_state"] = WorkflowState.POLICY_LOOKUP
-        self._done(state, "PolicyAgent", {
-            "match_score": round(pm.match_score, 2),
-            "is_covered": pm.is_covered,
-            "missing": len(pm.missing_requirements)
-        })
-        state = self._log(state, "policy_done", {"match_score": pm.match_score})
-        if cb: await cb(state)
-        return state
-
-    async def _validation(self, state, cb):
-        self._start(state, "ValidationAgent")
-        state["current_state"] = WorkflowState.VALIDATION
-        self._done(state, "ValidationAgent", {"can_proceed": True})
-        state = self._log(state, "validation_done", {})
-        if cb: await cb(state)
-        return state
-
-    async def _prediction(self, state, auth_req, cb):
-        """
-        Prediction Engine — scores approval probability using:
-        - Policy match score
-        - Clinical evidence completeness
-        - Medical necessity score
-        - Payer strictness heuristic
-        """
-        self._start(state, "PredictionAgent")
-        state["current_state"] = WorkflowState.PREDICTION
-
-        pm_data = state.get("policy_match", {})
-        ev_data = state.get("clinical_evidence", {})
-        na      = ev_data.get("necessity_analysis", {})
-
-        match_score       = float(pm_data.get("match_score", 0.5))
-        is_covered        = bool(pm_data.get("is_covered", False))
-        missing_count     = len(pm_data.get("missing_requirements", []))
-        satisfied_count   = len(pm_data.get("satisfied_requirements", []))
-        necessity_score   = float(na.get("necessity_score", 0.5))
-        na_recommendation = na.get("recommendation", "needs_review")
-
-        # Payer strictness (from historical denial rates)
-        payer = getattr(getattr(auth_req, "patient", None), "payer_name", "")
-        payer_factor = {
-            "Blue Cross Blue Shield": 0.0,
-            "Aetna": -0.05,
-            "UnitedHealthcare": -0.05,
-            "Cigna": -0.08,
-            "Medicare": 0.02,
-        }.get(payer, -0.03)
-
-        # Weighted approval probability
-        base = (match_score * 0.4) + (necessity_score * 0.35) + (0.1 if is_covered else 0.0)
-        doc_bonus  = min(satisfied_count * 0.04, 0.15)
-        doc_penalty= min(missing_count  * 0.06, 0.20)
-        approval_probability = max(0.05, min(0.95, base + doc_bonus - doc_penalty + payer_factor))
-
-        # Confidence band
-        if approval_probability >= self.HIGH_PROB_THRESHOLD:
-            risk_level = "low"
-            strategy   = "direct_submit"
-            reasoning  = f"Strong policy match ({match_score:.0%}) and necessity score ({necessity_score:.0%}). Confident approval expected."
-        elif approval_probability >= self.LOW_PROB_THRESHOLD:
-            risk_level = "medium"
-            strategy   = "submit_with_justification"
-            reasoning  = f"Moderate approval probability. Will submit with enhanced clinical justification to strengthen the request."
-        else:
-            risk_level = "high"
-            strategy   = "preemptive_appeal"
-            reasoning  = f"Low approval probability ({approval_probability:.0%}) due to {missing_count} unmet criteria. Generating appeal proactively before submission."
-
-        prediction = {
-            "approval_probability": round(approval_probability, 3),
-            "risk_level":           risk_level,
-            "strategy":             strategy,
-            "reasoning":            reasoning,
-            "policy_match_score":   round(match_score, 2),
-            "necessity_score":      round(necessity_score, 2),
-            "missing_criteria":     missing_count,
-            "satisfied_criteria":   satisfied_count,
-            "payer":                payer,
-        }
-        state["prediction"] = prediction
-
-        self._done(state, "PredictionAgent", {
-            "approval_probability": f"{approval_probability:.0%}",
-            "risk_level": risk_level,
-            "strategy": strategy,
-        })
-        state = self._log(state, "prediction_complete", prediction)
-        if cb: await cb(state)
-        return state
-
-    async def _decision_engine(self, state, auth_req, cb):
-        """
-        Decision Engine — acts on the prediction:
-        - HIGH prob  → submit directly
-        - MEDIUM prob → submit with extra clinical justification note
-        - LOW prob   → generate appeal letter NOW before submitting, attach to submission
-        """
-        self._start(state, "DecisionEngine")
-        state["current_state"] = WorkflowState.DECISION_ENGINE
-
-        prediction = state.get("prediction", {})
-        strategy   = prediction.get("strategy", "direct_submit")
-        prob       = prediction.get("approval_probability", 0.5)
-
-        if strategy == "preemptive_appeal":
-            # Generate appeal letter NOW — before any denial
-            state["current_state"] = WorkflowState.PREEMPTIVE_APPEAL
-            if cb: await cb(state)
-
-            ev = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
-            pm = _PolicyProxy(state.get("policy_match", {}))
-
-            # Create a synthetic denial analysis for the preemptive letter
-            preemptive_denial = {
-                "denial_reason": f"Anticipated denial: {', '.join(pm.missing_requirements[:2]) or 'incomplete documentation'}",
-                "primary_appeal_argument": "Proactive documentation package demonstrates full medical necessity per payer policy criteria.",
-                "supporting_evidence": [],
-                "urgency_indicators": [],
-                "peer_review_recommended": True,
-                "success_probability": min(prob + 0.2, 0.85)
-            }
-
-            self._start(state, "AppealAgent")
-            appeal_letter = await self.appeal.generate_appeal_letter(auth_req, preemptive_denial, ev, pm)
-            state["appeal_letter"]    = appeal_letter
-            state["denial_analysis"]  = preemptive_denial
-            state["preemptive_appeal"] = True
-            self._done(state, "AppealAgent", {
-                "word_count": len(appeal_letter.split()),
-                "type": "preemptive",
-                "success_probability": f"{preemptive_denial['success_probability']:.0%}"
-            })
-            state = self._log(state, "preemptive_appeal_generated", {
-                "word_count": len(appeal_letter.split()),
-                "strategy": "preemptive"
-            })
-
-        self._done(state, "DecisionEngine", {
-            "strategy":    strategy,
-            "probability": f"{prob:.0%}",
-            "action":      "Appeal pre-generated" if strategy == "preemptive_appeal" else "Proceeding with submission"
-        })
-        state["current_state"] = WorkflowState.DECISION_ENGINE
-        state = self._log(state, "decision_engine_complete", {"strategy": strategy})
-        if cb: await cb(state)
-        return state
-
-    async def _submission(self, state, auth_req, cb):
-        self._start(state, "SubmissionAgent")
-        ev  = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
-        pm  = _PolicyProxy(state.get("policy_match", {}))
-        preemptive_appeal = state.get("appeal_letter") if state.get("preemptive_appeal") else None
-
-        class _Auth:
-            def __init__(self, s, a):
-                self.id = s["auth_id"]; self.patient_id = s["patient_id"]
-                self.cpt_code = s["cpt_code"]; self.patient = a.patient
-                self.policy_match = pm
-
-        sa     = _Auth(state, auth_req)
-        bundle = await self.submission.build_fhir_bundle(sa, ev, pm, appeal_letter=preemptive_appeal)
-        result = await self.submission.submit_prior_authorization(sa, bundle)
-        state["fhir_bundle"]       = bundle
-        state["submission_result"] = result
-        state["current_state"]     = WorkflowState.SUBMISSION
-        self._done(state, "SubmissionAgent", {
-            "claim_id": result.get("claim_response_id"),
-            "status":   result.get("status"),
-            "strategy": "preemptive_appeal_attached" if preemptive_appeal else "standard"
-        })
-        state = self._log(state, "submission_done", {"status": result.get("status")})
-        if cb: await cb(state)
-        return state
-
-    async def _monitoring(self, state, cb):
-        self._start(state, "MonitoringAgent")
-        res     = state.get("submission_result", {})
-        dec     = res.get("decision", {})
-        outcome = str(dec.get("outcome") or res.get("status") or "pending").lower()
-
-        if outcome == "approved":
-            state["current_state"] = WorkflowState.APPROVED
-            self._done(state, "MonitoringAgent", {"decision": "approved"})
-        elif outcome == "denied":
-            state["current_state"] = WorkflowState.DENIED
-            existing_denial = state.get("denial_analysis", {})
-            state["denial_analysis"] = {
-                **existing_denial,
-                "denial_reason": dec.get("reason") or "Service not medically necessary"
-            }
-            self._done(state, "MonitoringAgent", {"decision": "denied"})
-        else:
-            # pending / timeout — payer hasn't decided yet
-            # Keep state as MONITORING so the UI shows "Awaiting payer review"
-            state["current_state"] = WorkflowState.MONITORING
-            self._done(state, "MonitoringAgent", {
-                "decision": "awaiting_review",
-                "note": "Payer review in progress — check payer portal"
-            })
-
-        state = self._log(state, "payer_decision", {"outcome": outcome})
-        if cb: await cb(state)
-        return state
-
-    async def _appeal_generate(self, state, auth_req, cb):
-        """Standard (post-denial) appeal generation."""
-        denial = state.get("denial_analysis", {}).get("denial_reason", "Not medically necessary")
-        ev     = _EvidenceProxy(state.get("clinical_evidence", {}).get("evidence", {}))
-        pm     = _PolicyProxy(state.get("policy_match", {}))
-
-        analysis = await self.appeal.analyze_denial(auth_req, denial, ev, pm)
-        state["denial_analysis"] = analysis
-        state["current_state"]   = WorkflowState.APPEAL_ANALYSIS
-        if cb: await cb(state)
-
-        self._start(state, "AppealAgent")
-        letter = await self.appeal.generate_appeal_letter(auth_req, analysis, ev, pm)
-        state["appeal_letter"]   = letter
-        state["current_state"]   = WorkflowState.APPEAL_GENERATION
-        self._done(state, "AppealAgent", {
-            "word_count": len(letter.split()),
-            "success_probability": f"{analysis.get('success_probability', 0.5):.0%}"
-        })
-        state = self._log(state, "appeal_generated", {"word_count": len(letter.split())})
-        if cb: await cb(state)
-        return state
-
-    async def _appeal_submit(self, state, auth_req, cb):
-        """Submit appeal back to FHIR server."""
-        self._start(state, "AppealSubmissionAgent")
-        state["current_state"] = WorkflowState.APPEAL_SUBMISSION
-        if cb: await cb(state)
-
-        pm = _PolicyProxy(state.get("policy_match", {}))
-
-        class _AppealAuth:
-            def __init__(self, s, a):
-                self.id = s["auth_id"] + "-APPEAL"
-                self.patient_id = s["patient_id"]
-                self.cpt_code   = s["cpt_code"]
-                self.patient    = a.patient
-                self.policy_match = pm
-
-        aa     = _AppealAuth(state, auth_req)
-        result = await self.submission.submit_appeal(aa, state.get("fhir_bundle", {}), state.get("appeal_letter", ""))
-        state["appeal_submission_result"] = result
-        self._done(state, "AppealSubmissionAgent", {
-            "claim_id": result.get("claim_response_id"),
-            "status":   result.get("status", "submitted"),
-            "message":  result.get("message", "Appeal sent to payer")
-        })
-        state = self._log(state, "appeal_submitted", {"claim_id": result.get("claim_response_id")})
-        if cb: await cb(state)
-        return state
-
-    async def _appeal_monitoring(self, state, cb):
-        """
-        Poll the FHIR server for the appeal decision (separate claim ID).
-        Updates current_state to APPEAL_APPROVED or APPEAL_DENIED.
-        """
-        self._start(state, "AppealMonitoringAgent")
-        state["current_state"] = WorkflowState.APPEAL_MONITORING
-        if cb: await cb(state)
-
-        appeal_result = state.get("appeal_submission_result", {})
-        appeal_claim_id = appeal_result.get("claim_response_id")
-
-        if not appeal_claim_id:
-            # No real FHIR server (mock mode) — leave as appeal_submission
-            self._done(state, "AppealMonitoringAgent", {"decision": "awaiting_payer_review"})
-            state = self._log(state, "appeal_monitoring_skipped", {"reason": "no_claim_id"})
-            if cb: await cb(state)
-            return state
-
-        # Poll for the appeal decision
-        decision_data = await self.submission._poll(appeal_claim_id)
-        appeal_outcome = decision_data.get("auth_status", "pending")
-
-        if appeal_outcome == "approved":
-            state["current_state"] = WorkflowState.APPEAL_APPROVED
-        elif appeal_outcome == "denied":
-            state["current_state"] = WorkflowState.APPEAL_DENIED
-        else:
-            # Still pending — leave as appeal_submission so UI shows "awaiting"
-            state["current_state"] = WorkflowState.APPEAL_SUBMISSION
-
-        state["appeal_decision"] = {
-            "outcome":        appeal_outcome,
-            "decided_at":     decision_data.get("decided_at"),
-            "reviewer":       decision_data.get("reviewer"),
-            "denial_reason":  decision_data.get("denial_reason"),
-        }
-
-        self._done(state, "AppealMonitoringAgent", {
-            "decision": appeal_outcome,
-            "decided_at": decision_data.get("decided_at", "")
-        })
-        state = self._log(state, "appeal_decision_received", {"outcome": appeal_outcome})
-        if cb: await cb(state)
-        return state
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _start(self, state, name):
-        state["agents"][name] = {
-            "name": name, "status": AgentStatus.RUNNING,
-            "start_time": datetime.now(), "end_time": None,
-            "input_data": {}, "output_data": {}, "reasoning_steps": [],
-            "error": None, "tokens_used": 0
-        }
-        state["updated_at"] = datetime.now()
-
-    def _done(self, state, name, output):
-        if name in state["agents"]:
-            state["agents"][name]["status"]      = AgentStatus.COMPLETED
-            state["agents"][name]["end_time"]    = datetime.now()
-            state["agents"][name]["output_data"] = output
-        state["updated_at"] = datetime.now()
-
-    def _log(self, state, event, data):
-        state["processing_log"].append({
-            "timestamp": datetime.now().isoformat(),
-            "event_type": event,
-            "state": str(state["current_state"]),
-            "data": data
-        })
-        return state
-
-    def _init(self, auth_req):
-        return {
-            "auth_id": auth_req.id, "patient_id": auth_req.patient_id,
-            "service_type": auth_req.service_type, "cpt_code": auth_req.cpt_code,
-            "icd10_code": auth_req.icd10_code,
-            "current_state": WorkflowState.PENDING, "target_state": None,
+    async def execute_workflow(self, auth_request, clinical_notes, callback=None) -> Dict[str, Any]:
+        initial: GraphState = {
+            "auth_id": auth_request.id, "patient_id": auth_request.patient_id,
+            "service_type": auth_request.service_type, "cpt_code": auth_request.cpt_code,
+            "icd10_code": auth_request.icd10_code,
+            "_auth_request": auth_request, "_clinical_notes": clinical_notes,
+            "_callback": callback, "_clinical_reader": self.clinical_reader,
+            "_policy": self.policy, "_submission": self.submission, "_appeal": self.appeal,
+            "current_state": WorkflowState.PENDING,
             "clinical_evidence": None, "policy_requirements": None, "policy_match": None,
-            "prediction": None, "preemptive_appeal": False,
-            "fhir_bundle": None, "submission_result": None,
-            "denial_analysis": None, "appeal_letter": None,
+            "prediction": None, "preemptive_appeal": False, "fhir_bundle": None,
+            "submission_result": None, "denial_analysis": None, "appeal_letter": None,
             "appeal_submission_result": None, "appeal_decision": None,
-            "agents": {}, "error": None,
+            "agents": {}, "error": None, "processing_log": [],
             "created_at": datetime.now(), "updated_at": datetime.now(),
-            "processing_log": []
         }
+        try:
+            final = await self._graph.ainvoke(initial)
+        except Exception as e:
+            print(f"[LANGGRAPH ERROR]\n{traceback.format_exc()}")
+            final = {**initial, "current_state": WorkflowState.REQUIRES_HUMAN_REVIEW, "error": str(e)}
+            final = _log_event(final, "error", {"error": str(e)})
+            if callback: await callback(final)
+        return self._compile(final)
 
-    def _compile(self, state):
+    def _compile(self, s: GraphState) -> Dict[str, Any]:
         return {
-            "auth_id":                  state["auth_id"],
-            "status":                   state["current_state"],
-            "current_state":            state["current_state"],
-            "clinical_evidence":        state.get("clinical_evidence"),
-            "policy_match":             state.get("policy_match"),
-            "prediction":               state.get("prediction"),
-            "submission_result":        state.get("submission_result"),
-            "denial_analysis":          state.get("denial_analysis"),
-            "appeal_letter":            state.get("appeal_letter"),
-            "appeal_submission_result": state.get("appeal_submission_result"),
-            "appeal_decision":          state.get("appeal_decision"),
-            "agents":                   state["agents"],
-            "processing_log":           state["processing_log"],
-            "error":                    state.get("error"),
-            "completed_at":             datetime.now().isoformat()
+            "auth_id": s.get("auth_id"), "status": s.get("current_state"),
+            "current_state": s.get("current_state"),
+            "clinical_evidence": s.get("clinical_evidence"),
+            "policy_match": s.get("policy_match"), "prediction": s.get("prediction"),
+            "submission_result": s.get("submission_result"), "denial_analysis": s.get("denial_analysis"),
+            "appeal_letter": s.get("appeal_letter"),
+            "appeal_submission_result": s.get("appeal_submission_result"),
+            "appeal_decision": s.get("appeal_decision"),
+            "agents": s.get("agents", {}), "processing_log": s.get("processing_log", []),
+            "error": s.get("error"), "completed_at": datetime.now().isoformat(),
         }
 
 
-def create_workflow(cr, policy, submission, appeal):
+def create_workflow(cr, policy, submission, appeal) -> AuthorizationWorkflow:
     return AuthorizationWorkflow(cr, policy, submission, appeal)
